@@ -132,8 +132,27 @@ def cmd_presets(a):
 
 
 # --------------------------------------------------------------- helpers
+def _supercell_matrix_from_yaml(path):
+    """Read 'supercell_matrix' from phonopy_disp.yaml / phonopy.yaml without
+    needing PyYAML. Returns 9 ints or None."""
+    try:
+        lines = open(path).read().splitlines()
+    except OSError:
+        return None
+    for i, ln in enumerate(lines):
+        if ln.strip().startswith("supercell_matrix:"):
+            vals = []
+            for row in lines[i + 1:i + 4]:
+                vals += [int(round(float(v))) for v in
+                         row.replace("-", " ", 1).replace("[", " ")
+                         .replace("]", " ").replace(",", " ").split()]
+            return vals if len(vals) == 9 else None
+    return None
+
+
 def _ensure_force_constants(fc_path):
-    """Write FORCE_CONSTANTS with phonopy if only FORCE_SETS exists."""
+    """Write FORCE_CONSTANTS with phonopy if only FORCE_SETS exists. Works
+    with phonopy 2.x (incl. old releases), 3.x and 4.x."""
     if os.path.exists(fc_path):
         return
     d = os.path.dirname(fc_path) or "."
@@ -141,22 +160,37 @@ def _ensure_force_constants(fc_path):
         raise SystemExit(f"{fc_path} not found, and no FORCE_SETS in {d} to "
                          "make it from. Run 'phonopy -f disp-*/vasprun.xml' "
                          "(phonopy-init -f for phonopy >= 4) first.")
+    yaml = next((y for y in ("phonopy_disp.yaml", "phonopy.yaml")
+                 if os.path.exists(os.path.join(d, y))), None)
+    cmds = []
+    if yaml:
+        cmds.append(["phonopy-load", yaml, "--writefc", "--full-fc"])
+        dim = _supercell_matrix_from_yaml(os.path.join(d, yaml))
+        if dim and os.path.exists(os.path.join(d, "POSCAR")):
+            dims = dim if any(dim[i] for i in (1, 2, 3, 5, 6, 7)) else \
+                [dim[0], dim[4], dim[8]]
+            cmds.append(["phonopy", "-c", "POSCAR", "--dim",
+                         " ".join(map(str, dims)), "--writefc", "--full-fc"])
+    cmds.append(["phonopy", "--writefc", "--full-fc"])        # phonopy >= 4
     tried = []
-    for cmd in (["phonopy-load", "--writefc", "--full-fc"],
-                ["phonopy", "--writefc", "--full-fc"]):
+    for cmd in cmds:
         try:
             r = subprocess.run(cmd, cwd=d, capture_output=True, text=True)
         except FileNotFoundError:
-            tried.append(f"{cmd[0]}: not found")
+            tried.append(f"{cmd[0]}: command not found")
             continue
         if r.returncode == 0 and os.path.exists(fc_path):
-            print(f"[phunfold] wrote {fc_path} with '{' '.join(cmd)}' "
-                  f"in {d}")
+            print(f"[phunfold] wrote {fc_path} with: {' '.join(cmd)}")
             return
-        tried.append(f"{' '.join(cmd)}: {(r.stderr or r.stdout).strip()[-300:]}")
-    raise SystemExit("could not create FORCE_CONSTANTS automatically:\n  "
-                     + "\n  ".join(tried) + "\nRun phonopy with --writefc "
-                     "--full-fc yourself in " + d)
+        msg = [ln for ln in (r.stderr + r.stdout).splitlines()
+               if "rror" in ln or "not found" in ln]
+        tried.append(f"{' '.join(cmd)}  ->  " + (msg[-1].strip() if msg
+                                                  else "no FORCE_CONSTANTS"))
+    raise SystemExit(
+        "could not create FORCE_CONSTANTS automatically. Tried:\n  "
+        + "\n  ".join(tried) + "\nIn " + os.path.abspath(d) + " run, with "
+        "the --dim you used for 'phonopy -d':\n  phonopy -c POSCAR --dim "
+        "N N N --writefc --full-fc")
 
 
 def _mapping_options(a):
