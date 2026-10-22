@@ -343,16 +343,26 @@ def cmd_unfold(a):
     _plot(res, a, ref_bands)
 
 
-def _compare(res, ref_bands, tol=1e-3):
-    """Largest |summed weight of a degenerate group - number of reference
-    branches at that frequency| over the path (0 for a perfect unfolding)."""
+def _compare(res, ref_bands, tol=1e-6):
+    """Largest |unfolded weight - number of reference branches| over clusters
+    of equal eigenvalues (0 for a perfect unfolding).
+
+    Works on omega^2 (sign kept), which both calculations give to machine
+    precision: clusters are formed from the union of supercell and reference
+    eigenvalues, split where neighbours differ by more than ``tol`` THz^2, so
+    near-degenerate but distinct bands are never lumped together."""
     worst = 0.0
     for f, w, b in zip(res.freqs, res.weights, ref_bands):
-        o = np.argsort(f)
-        f, w = f[o], w[o]
-        for g in np.split(np.arange(len(f)), np.where(np.diff(f) > tol)[0] + 1):
-            n = np.sum(np.abs(b - f[g].mean()) < tol + np.ptp(f[g]))
-            worst = max(worst, abs(w[g].sum() - n))
+        e_s, e_r = np.sign(f) * f ** 2, np.sign(b) * b ** 2
+        vals = np.concatenate([e_s, e_r])
+        is_ref = np.concatenate([np.zeros(len(e_s), bool), np.ones(len(e_r), bool)])
+        wts = np.concatenate([w, np.zeros(len(e_r))])
+        o = np.argsort(vals)
+        vals, is_ref, wts = vals[o], is_ref[o], wts[o]
+        scale = max(1.0, np.abs(vals).max())
+        cuts = np.where(np.diff(vals) > tol * scale)[0] + 1
+        for g in np.split(np.arange(len(vals)), cuts):
+            worst = max(worst, abs(wts[g].sum() - is_ref[g].sum()))
     return worst
 
 

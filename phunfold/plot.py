@@ -24,6 +24,19 @@ def _decorate(ax, path, ylim, units):
     ax.set_ylabel(UNIT_LABEL[units])
 
 
+def _broken_lines(x, y):
+    """Insert NaN rows where consecutive k-points share the same x (path
+    breaks, and Gamma approached from two directions with NAC) so line plots
+    do not draw vertical connectors there."""
+    x = np.asarray(x)
+    y = np.asarray(y, float)
+    cut = np.where(np.diff(x) <= 1e-12)[0] + 1
+    if not len(cut):
+        return x, y
+    return (np.insert(x.astype(float), cut, np.nan),
+            np.insert(y, cut, np.nan, axis=0))
+
+
 def _match(fa, fb, max_jump, fa_pred=None):
     """Greedy pairing of modes at two neighbouring k-points, closest first.
     ``fa_pred`` (fa extrapolated along each branch's slope) keeps nearby
@@ -162,8 +175,8 @@ def plot_unfolded(result, ax=None, style="spectral", units="THz", ylim=None,
             ax.scatter(xx, f[sel], s=size * w[sel],
                        c="C3" if style == "both" else "k", lw=0, zorder=3)
     if reference_bands is not None:
-        ax.plot(x, reference_bands * c, color="C0", lw=0.7, ls="--",
-                alpha=0.8, zorder=2)
+        xb, yb = _broken_lines(x, reference_bands * c)
+        ax.plot(xb, yb, color="C0", lw=0.7, ls="--", alpha=0.8, zorder=2)
     _decorate(ax, result.path, ylim, units)
     if title:
         ax.set_title(title)
@@ -176,7 +189,7 @@ def plot_folded(result, ax=None, units="THz", ylim=None, color="k"):
 
     if ax is None:
         _, ax = plt.subplots(figsize=(7, 4.5))
-    ax.plot(result.path["x"], result.freqs * UNITS[units], color=color,
-            lw=0.4)
+    xb, yb = _broken_lines(result.path["x"], result.freqs * UNITS[units])
+    ax.plot(xb, yb, color=color, lw=0.4)
     _decorate(ax, result.path, ylim, units)
     return ax
