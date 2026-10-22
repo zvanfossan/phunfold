@@ -156,3 +156,55 @@ def write_poscar(structure: Structure, filename, comment="phunfold",
     with open(filename, "w") as fh:
         fh.write("\n".join(out) + "\n")
     return s
+
+
+def read_structure(filename) -> Structure:
+    """POSCAR/CONTCAR natively; any other format (cif, xyz, QE/ABINIT input,
+    ...) through ASE if it is installed. Units must be Angstrom."""
+    try:
+        return read_poscar(filename)
+    except Exception as err_poscar:  # noqa: BLE001
+        try:
+            import ase.io
+        except ImportError:
+            raise ValueError(
+                f"could not read {filename} as POSCAR ({err_poscar}); install "
+                "ase to read other formats") from None
+        atoms = ase.io.read(filename)
+        return Structure(atoms.cell[:], atoms.get_scaled_positions(),
+                         atoms.get_chemical_symbols(), atoms.get_masses())
+
+
+def make_supercell(prim: Structure, M) -> Structure:
+    """Supercell with lattice M @ prim.lattice (any integer M, det > 0).
+    Atom order: for each lattice point, the full primitive basis."""
+    import itertools
+
+    M = np.array(M, dtype=int).reshape(3, 3)
+    n = int(round(abs(np.linalg.det(M))))
+    if n == 0:
+        raise ValueError("singular supercell matrix")
+    lat = M @ prim.lattice
+    # lattice points inside the supercell: all R with R inv(M) in [0, 1)
+    inv_m = np.linalg.inv(M)
+    corners = np.array(list(itertools.product([0, 1], repeat=3))) @ M
+    lo, hi = corners.min(0), corners.max(0)
+    grid = np.array(list(itertools.product(
+        *[range(a, b + 1) for a, b in zip(lo, hi)])))
+    g = grid @ inv_m
+    inside = np.all((g > -1e-8) & (g < 1 - 1e-8), axis=1)
+    pts = grid[inside]
+    assert len(pts) == n, (len(pts), n)
+    frac = ((pts[:, None, :] + prim.frac[None, :, :]) @ inv_m).reshape(-1, 3)
+    syms = list(prim.symbols) * n
+    masses = np.tile(prim.masses, n)
+    return Structure(lat, frac % 1.0, syms, masses)
+
+
+def rattle(structure: Structure, amplitude=0.01, seed=None) -> Structure:
+    """Copy with Gaussian random displacements (Angstrom)."""
+    rng = np.random.default_rng(seed)
+    s = structure.copy()
+    s.frac = s.frac + rng.normal(scale=amplitude, size=s.frac.shape) @ \
+        np.linalg.inv(s.lattice)
+    return s

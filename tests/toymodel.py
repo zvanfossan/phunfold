@@ -10,7 +10,7 @@ import itertools
 
 import numpy as np
 
-from phunfold.structure import Structure
+from phunfold.structure import Structure, make_supercell
 from phunfold.dynmat import VASP_TO_THZ
 
 A0 = 4.0
@@ -28,6 +28,8 @@ SPRINGS = {
     ("O", "O", 4.0): (0.3, 0.1),
 }
 CUTOFF = 4.05
+# substitutes inherit the springs of the host species (masses differ)
+SPECIES_ALIAS = {"Sr": "Ba", "Zr": "Ti"}
 
 
 def perovskite(a=A0):
@@ -36,26 +38,7 @@ def perovskite(a=A0):
 
 def tile(prim: Structure, M):
     """Supercell with lattice M @ prim.lattice (M integer, any shape)."""
-    M = np.array(M, dtype=int)
-    lat = M @ prim.lattice
-    inv = np.linalg.inv(lat)
-    n = int(round(abs(np.linalg.det(M))))
-    # enumerate lattice points inside the supercell
-    corners = np.array(list(itertools.product([0, 1], repeat=3))) @ M
-    lo, hi = corners.min(0), corners.max(0)
-    pts = []
-    for r in itertools.product(*[range(l, h + 1) for l, h in zip(lo, hi)]):
-        g = np.array(r) @ prim.lattice @ inv
-        if np.all(g > -1e-8) and np.all(g < 1 - 1e-8):
-            pts.append(r)
-    assert len(pts) == n, (len(pts), n)
-    frac, sym = [], []
-    for r in pts:
-        for f, s in zip(prim.frac, prim.symbols):
-            frac.append((np.array(r) + f) @ prim.lattice @ inv)
-            sym.append(s)
-    frac = np.array(frac) % 1.0
-    return Structure(lat, frac, sym)
+    return make_supercell(prim, M)
 
 
 def bonds(ideal: Structure, modulate=None, cutoff=CUTOFF):
@@ -75,6 +58,11 @@ def bonds(ideal: Structure, modulate=None, cutoff=CUTOFF):
                               d[(d > 1e-6) & (d < cutoff)]):
                 key = tuple(sorted([ideal.symbols[i], ideal.symbols[j]])) + (
                     round(dd, 2),)
+                if key not in SPRINGS:
+                    key2 = tuple(sorted(SPECIES_ALIAS.get(x, x) for x in key[:2])) + key[2:]
+                    if key2 not in SPRINGS:
+                        continue
+                    key = key2
                 kl, kt = SPRINGS[key]
                 s = 1.0 if modulate is None else modulate(i, j, vv)
                 n = vv / dd

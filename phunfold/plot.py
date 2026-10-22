@@ -27,7 +27,7 @@ def _decorate(ax, path, ylim, units):
 def plot_unfolded(result, ax=None, style="spectral", units="THz", ylim=None,
                   sigma=0.12, n_omega=600, wmin=0.02, size=14.0,
                   color_by=None, cmap=None, reference_bands=None,
-                  title=None, colorbar=True):
+                  title=None, colorbar=True, weights=None, vmax=None):
     """Plot an UnfoldResult.
 
     style : 'spectral' (broadened A(k,w) map), 'scatter' (fat bands, marker
@@ -36,6 +36,9 @@ def plot_unfolded(result, ax=None, style="spectral", units="THz", ylim=None,
             'wall_participation') used to colour scatter markers.
     reference_bands : optional (freqs (nq, nb)) from a bulk reference cell
             calculation on the same path, drawn as thin dashed lines.
+    weights : plot these weights instead of result.weights (e.g. a
+            species-resolved array result.extra['w_Ti']).
+    vmax : colour-scale maximum of the spectral map (share between panels).
     sigma : broadening in ``units``.
     """
     import matplotlib.pyplot as plt
@@ -44,7 +47,7 @@ def plot_unfolded(result, ax=None, style="spectral", units="THz", ylim=None,
         _, ax = plt.subplots(figsize=(7, 4.5))
     c = UNITS[units]
     f = result.freqs * c
-    w = result.weights
+    w = result.weights if weights is None else weights
     x = result.path["x"]
     if ylim is None:
         ylim = (min(0.0, f.min() * 1.05), f.max() * 1.05)
@@ -54,21 +57,22 @@ def plot_unfolded(result, ax=None, style="spectral", units="THz", ylim=None,
         a = spectral_function(f, w, omega, sigma=sigma)
         mappable = ax.pcolormesh(x, omega, a, shading="gouraud",
                                  cmap=cmap or "Greys",
-                                 vmin=0, vmax=np.percentile(a, 99.5))
+                                 vmin=0, vmax=vmax or np.percentile(a, 99.5))
         if colorbar and color_by is None:
             plt.colorbar(mappable, ax=ax, pad=0.01).set_label("A(k, ω) (arb.)")
     if style in ("scatter", "both"):
         sel = w > wmin
         xx = np.broadcast_to(x[:, None], f.shape)[sel]
         if color_by is not None:
-            col = result.extra[color_by][sel]
+            key = color_by if color_by in result.extra else f"proj_{color_by}"
+            col = result.extra[key][sel]
             order = np.argsort(col)   # draw strongly localised modes on top
             sc = ax.scatter(xx[order], f[sel][order], s=size * w[sel][order],
                             c=col[order], cmap=cmap or "viridis", vmin=0,
                             vmax=max(col.max(), 1e-9), lw=0, zorder=3)
             if colorbar:
                 plt.colorbar(sc, ax=ax, pad=0.01).set_label(
-                    color_by.replace("_", " "))
+                    f"fraction on '{color_by}'")
         else:
             ax.scatter(xx, f[sel], s=size * w[sel],
                        c="C3" if style == "both" else "k", lw=0, zorder=3)

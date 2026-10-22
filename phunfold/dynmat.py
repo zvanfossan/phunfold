@@ -1,4 +1,5 @@
-"""Supercell dynamical matrices: a native NumPy engine and a phonopy wrapper.
+"""Supercell dynamical matrices: native NumPy engine (phonopy FORCE_CONSTANTS
+from any calculator), phonopy wrapper, or any user-supplied solver.
 
 Both backends expose the same interface::
 
@@ -58,6 +59,35 @@ def read_force_constants(filename, n_supercell=None):
     return fc, rows_idx
 
 
+def read_force_constants_hdf5(filename):
+    """Read phonopy's force_constants.hdf5 (needs h5py). Returns (fc, rows)."""
+    import h5py  # optional dependency
+
+    with h5py.File(filename, "r") as h:
+        fc = h["force_constants"][:]
+        rows = (h["p2s_map"][:] if "p2s_map" in h and len(h["p2s_map"]) ==
+                fc.shape[0] else np.arange(fc.shape[0]))
+    return fc, np.asarray(rows, int)
+
+
+def load_force_constants(filename, n_supercell=None):
+    """Text FORCE_CONSTANTS or .hdf5, chosen by extension."""
+    if str(filename).endswith((".hdf5", ".h5")):
+        return read_force_constants_hdf5(filename)
+    return read_force_constants(filename, n_supercell)
+
+
+# Conversion of force constants to eV/A^2 (positions must be in Angstrom).
+BOHR = 0.529177210903
+FC_UNITS = {
+    "eV/A^2": 1.0,
+    "eV/bohr^2": 1.0 / BOHR ** 2,
+    "Ry/bohr^2": 13.605693122994 / BOHR ** 2,
+    "Ha/bohr^2": 27.211386245988 / BOHR ** 2,
+    "kJ/mol/nm^2": 1.0 / 96.485332 / 100.0,
+}
+
+
 def map_to_unitcell(unitcell: Structure, supercell: Structure, tol=1e-3):
     """For every supercell atom return the index of the unit-cell atom it is a
     lattice translate of (``s2p``). Tolerance in Angstrom."""
@@ -115,21 +145,34 @@ class NativeBackend:
         phonopy FORCE_CONSTANTS (text). Full or compact both work.
     acoustic_sum_rule : bool
         Re-impose sum_j Phi_ij = 0 on the self terms (cheap, recommended).
+    masses : array (n_unitcell,) or dict {'O': 17.999} to override masses
+        (isotopes, mass-disorder studies).
+    fc_units : key of FC_UNITS; structure files must be in Angstrom.
+    fc_threshold : drop force-constant blocks with max |Phi| below this
+        (eV/A^2) after the ASR correction; speeds up and shrinks very large
+        cells. 0 keeps everything (exact).
     """
 
     def __init__(self, unitcell, supercell, force_constants,
-                 acoustic_sum_rule=True, masses=None, tol=1e-3):
-        self.structure = (read_poscar(unitcell) if not isinstance(
-            unitcell, Structure) else unitcell)
-        sc = (read_poscar(supercell) if not isinstance(supercell, Structure)
-              else supercell)
-        if masses is not None:
+                 acoustic_sum_rule=True, masses=None, tol=1e-3,
+                 fc_units="eV/A^2", fc_threshold=0.0, chunk=200000):
+        from .structure import read_structure
+
+        self.structure = (read_structure(unitcell) if not isinstance(
+            unitcell, Structure) else unitcell.copy())
+        sc = (read_structure(supercell) if not isinstance(
+            supercell, Structure) else supercell)
+        if isinstance(masses, dict):
+            self.structure.masses = np.array(
+                [masses.get(s, m) for s, m in zip(self.structure.symbols,
+                                                  self.structure.masses)])
+        elif masses is not None:
             self.structure.masses = np.asarray(masses, float)
         if isinstance(force_constants, (tuple, list)):
             fc, rows = force_constants
         else:
-            fc, rows = read_force_constants(force_constants, sc.natoms)
-        fc = np.array(fc, dtype=float)
+            fc, rows = load_force_constants(force_constants, sc.natoms)
+        fc = np.array(fc, dtype=float) * FC_UNITS[fc_units]
         s2p = map_to_unitcell(self.structure, sc, tol=tol)
         nu = self.structure.natoms
 
@@ -151,23 +194,32 @@ class NativeBackend:
         else:
             self.asr_violation = np.abs(fc_rep.sum(axis=1)).max()
 
-        # difference vectors r_j - r_rep(p) with minimum-image multiplicity
+        # difference vectors r_j - r_rep(p) with minimum-image multiplicity,
+        # skipping negligible blocks and working in chunks to bound memory
         r_sc = sc.cart
-        p_idx = np.repeat(np.arange(nu), sc.natoms)
-        j_idx = np.tile(np.arange(sc.natoms), nu)
-        vec = r_sc[j_idx] - r_sc[rep_sc[p_idx]]
-        ent, vecs = _minimum_image_vectors(vec, sc.lattice, tol=tol)
-        mult = np.bincount(ent, minlength=len(vec))
-        self._p = p_idx[ent]
-        self._pp = s2p[j_idx[ent]]
-        self._vec = vecs
-        self._fc = (fc_rep[p_idx[ent], j_idx[ent]]
-                    / mult[ent][:, None, None])
+        p_all = np.repeat(np.arange(nu), sc.natoms)
+        j_all = np.tile(np.arange(sc.natoms), nu)
+        if fc_threshold > 0:
+            keep = (np.abs(fc_rep).max(axis=(2, 3)) >= fc_threshold).ravel()
+            p_all, j_all = p_all[keep], j_all[keep]
+        self.n_pairs = len(p_all)
+        P, PP, V, FC = [], [], [], []
+        mult_max = 1
+        for a in range(0, len(p_all), chunk):
+            p_idx, j_idx = p_all[a:a + chunk], j_all[a:a + chunk]
+            vec = r_sc[j_idx] - r_sc[rep_sc[p_idx]]
+            ent, vecs = _minimum_image_vectors(vec, sc.lattice, tol=tol)
+            mult = np.bincount(ent, minlength=len(vec))
+            mult_max = max(mult_max, int(mult.max()))
+            P.append(p_idx[ent])
+            PP.append(s2p[j_idx[ent]])
+            V.append(vecs)
+            FC.append(fc_rep[p_idx[ent], j_idx[ent]] / mult[ent][:, None, None])
+        self._p, self._pp = np.concatenate(P), np.concatenate(PP)
+        self._vec, self._fc = np.concatenate(V), np.concatenate(FC)
+        self.max_multiplicity = mult_max
         m = self.structure.masses
         self._inv_sqrt_mm = 1.0 / np.sqrt(np.outer(m, m))
-        # Gauge check: rep atom position must equal unit-cell position up to
-        # a unit-cell lattice vector (true by construction of s2p).
-        self.max_multiplicity = int(mult.max())
 
     def dynamical_matrix(self, k_cart):
         nu = self.structure.natoms
@@ -188,6 +240,34 @@ class NativeBackend:
             freqs[i] = np.sign(w2) * np.sqrt(np.abs(w2)) * VASP_TO_THZ
             vecs[i] = ev
         return freqs, vecs
+
+
+class CallableBackend:
+    """Wrap any eigen-solver: ``fn(k_cart) -> (freqs, eigvecs)`` for ONE k
+    (Cartesian, 1/A, no 2 pi; eigvecs columns = modes, r-gauge unless you
+    pass gauge='R' to the unfolding). Use it for eigenvectors from other
+    codes, ML potentials with analytic Hessians, tight-binding models, ..."""
+
+    def __init__(self, structure: Structure, fn):
+        self.structure = structure
+        self._fn = fn
+
+    def solve(self, k_cart):
+        k_cart = np.atleast_2d(k_cart)
+        out = [self._fn(k) for k in k_cart]
+        return (np.array([o[0] for o in out]),
+                np.array([o[1] for o in out]))
+
+
+class DynamicalMatrixBackend(CallableBackend):
+    """``fn(k_cart) -> D (3N x 3N complex, mass-weighted, eV/(A^2 amu))``;
+    diagonalised here and converted to THz (times ``factor``)."""
+
+    def __init__(self, structure: Structure, fn, factor=VASP_TO_THZ):
+        def solve_one(k):
+            w2, ev = np.linalg.eigh(fn(k))
+            return np.sign(w2) * np.sqrt(np.abs(w2)) * factor, ev
+        super().__init__(structure, solve_one)
 
 
 class PhonopyBackend:

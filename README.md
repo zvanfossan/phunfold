@@ -1,69 +1,192 @@
-# phunfold — phonon band unfolding for domain-wall supercells (VASP + phonopy)
+# phunfold — phonon band unfolding for any commensurate supercell
 
-A self-contained Python workflow that takes a large BaTiO3 supercell with
-ferroelectric domain walls, computes its phonons from VASP finite-displacement
-forces, and **unfolds** the supercell spectrum onto the 5-atom perovskite
-Brillouin zone. Wall-localised vibrations then show up as extra (often flat)
-branches with partial spectral weight, which the code can also flag by how much
-of each mode lives on the wall atoms.
+phunfold takes the phonons of a large supercell and **unfolds** them onto the
+Brillouin zone of a small reference cell. Each supercell mode gets a weight
+for how much it looks like a reference-cell Bloch wave at k. The result is an
+effective band structure where bulk-like branches stay sharp and features from
+broken translational symmetry show up as extra or smeared spectral weight.
+Typical uses:
 
-The unfolding engine is pure NumPy (no phonopy needed at that stage). phonopy is
-used only for what it is best at: generating symmetry-reduced displacements and
-turning forces into force constants.
+* **extended defects**: domain walls, interfaces, stacking faults, surfaces/slabs
+* **point defects**: vacancies, substitutions, interstitials
+* **disorder**: alloys and special quasirandom structures, mass disorder and isotopes
+* **distortions**: relaxed, rattled, or ML-MD snapshot cells; octahedral tilts
+  (unfold onto the untilted cell)
+
+What the supercell may differ in, relative to the reference:
+
+| Supercell differs from the reference by… | Handled by |
+|---|---|
+| Any integer supercell matrix M (non-diagonal, rotated basis) | automatic, or `--supercell-matrix` |
+| Rigid rotation and/or origin shift | lattice-metric search + origin search, automatic |
+| Strain up to `--strain-tol` (default 5 %) | reference lattice rebuilt as inv(M)·L_sc |
+| Atomic displacements up to `--max-displacement` (default 0.8 Å) | displacement phase, exact for periodic distortions |
+| Substitutions | `--species-map Sr=Ba,Zr=Ti` or `--any-species` |
+| Vacancies / interstitials | `--allow-vacancies` / `--allow-interstitials` |
+| No clean reference cell (alloys) | `--reference auto`: average structure of the supercell |
+
+Force constants can come from any code phonopy interfaces with (VASP, QE,
+ABINIT, CP2K, CASTEP, FHI-aims, ML potentials…) through phonopy's
+`FORCE_CONSTANTS`/`force_constants.hdf5`. You can also plug in your own
+eigen-solver (`CallableBackend`, `DynamicalMatrixBackend`), with eigenvectors in
+the r-gauge or the R-gauge (`gauge="R"`).
+
+The unfolding engine is pure NumPy. phonopy is only needed to generate
+displacements and turn forces into force constants.
 
 ```
 phunfold/
-  phunfold/structure.py   POSCAR I/O, masses, lattice conventions
-  phunfold/dynmat.py      dynamical matrix: native engine (FORCE_CONSTANTS) or phonopy wrapper
-  phunfold/unfold.py      atom mapping, unfolding weights, k-path, spectral function
-  phunfold/domainwall.py  180-degree domain-wall supercell builder
-  phunfold/vasp.py        INCAR/KPOINTS/POTCAR per stage, displacement dirs, OUTCAR Born parser
-  phunfold/plot.py        spectral-function and fat-band plots
-  phunfold/__main__.py    CLI:  phunfold {build-dw, setup, setup-disp, unfold, plot}
-  tests/                  exact validation against a toy perovskite force field
-  examples/               end-to-end dry run + SLURM array script
+  phunfold/structure.py    POSCAR I/O (other formats via ASE), supercells, masses
+  phunfold/lattice.py      supercell-matrix / orientation search, average reference cell
+  phunfold/mapping.py      atom -> site mapping (origin, substitutions, vacancies, interstitials)
+  phunfold/dynmat.py       dynamical matrix: native (FORCE_CONSTANTS), phonopy, or user callable
+  phunfold/unfold.py       unfolding weights (total / sublattice-resolved), pipeline, results
+  phunfold/paths.py        k-path presets and coordinate frames
+  phunfold/projections.py  atom groups: species, indices, sites, slabs, spheres, defects
+  phunfold/plot.py         spectral-function and fat-band plots
+  phunfold/domainwall.py   180° domain-wall builder (worked example)
+  phunfold/vasp.py         VASP inputs per stage, displacement dirs, OUTCAR Born parser
+  phunfold/__main__.py     CLI: phunfold {unfold, plot, supercell, presets, build-dw, setup, setup-disp}
+  tests/                   exact validation against a toy perovskite force field
+  examples/                end-to-end dry runs (domain wall; rotated defect cell) + SLURM script
 ```
 
-Install (on the cluster): `pip install -e .`  (add `phonopy` to the same
-environment for steps 2 and 5–6).
+Install: `pip install -e .` (add `phonopy` to the same environment for
+force-constant generation; `ase` and `h5py` are optional).
+
+---
+
+## Quick start: unfolding any supercell
+
+You need three things:
+
+1. **The supercell** whose phonons you want. Its force constants come from
+   phonopy's usual route: displacements on the supercell (`--dim` for extra
+   repetitions if needed), forces from your code, `FORCE_CONSTANTS` with
+   `--full-fc`.
+2. **The reference cell** to unfold onto: a small cell with the same lattice
+   type and basis. It doesn't need the same orientation, origin, atom order, or
+   exact lattice constants.
+3. **A k-path** in the reference cell's coordinates: a preset or your own.
+
+```bash
+phunfold unfold --unitcell POSCAR --sposcar SPOSCAR --fc FORCE_CONSTANTS \
+                --reference POSCAR_prim --path cubic --out unfolded
+```
+
+Common variations:
+
+```bash
+# substitutional alloy, with Sr and Zr on the Ba and Ti sites; species-resolved spectra
+phunfold unfold ... --species-map Sr=Ba,Zr=Ti --resolve species
+
+# vacancy + substitution; flag modes localised around the defect
+phunfold unfold ... --allow-vacancies --species-map Sr=Ba \
+                    --project defect=sphere:0.5,0.5,0.5:3.0 Sr=species:Sr
+
+# interface / domain wall / stacking fault at fractional 0 and 0.5 along lattice vector 0
+phunfold unfold ... --project interface=slab:0:0,0.5:2.5
+
+# no clean reference cell (e.g. SQS): use the average structure of a 4x4x4 cell
+phunfold unfold ... --reference auto --supercell-matrix "4 4 4" --any-species
+
+# path in supercell coordinates, or Cartesian (1/Å, reference-file frame)
+phunfold unfold ... --path "G 0 0 0, X 1/2 0 0" --path-frame supercell
+
+# isotopes, very large cells, Quantum ESPRESSO force constants
+phunfold unfold ... --mass O=17.999 --fc-threshold 1e-4 --fc-units Ry/bohr^2
+```
+
+`phunfold presets` lists the built-in paths: `cubic`, `tetragonal`,
+`orthorhombic`, `hexagonal` (γ = 120°), `fcc`, `bcc` (Setyawan–Curtarolo
+labels), and `dw-tetragonal`. The fcc and bcc presets are defined in Cartesian
+cubic-axis units, so they work with any primitive-vector convention as long as
+the cubic axes of your reference file lie along x, y, z.
+
+`phunfold supercell --reference POSCAR_prim --matrix "2 2 2" --rattle 0.01`
+builds test supercells. The best validation of a new setup is to unfold a
+defect-free supercell made this way: every weight must be 0 or 1, on top of
+the primitive bands.
+
+### Orientation choices
+
+If the files are already in the same orientation
+(`sc.lattice ≈ M · ref.lattice`) and every atom maps validly, that orientation
+is always used. Only otherwise does the code search all proper rotations and
+re-basings of the reference lattice, keeping the one whose basis fits the atoms
+best. It then prints where the reference a, b, c axes ended up. If the
+supercell has lower symmetry than the reference (walls, interfaces, uniaxial
+strain), equivalent orientations give physically different path directions,
+for example X normal to a wall versus X in its plane. The code warns when
+that ambiguity exists; fix it with `--supercell-matrix` or by writing both
+cells in the same orientation.
+
+### Python API
+
+```python
+from phunfold import NativeBackend, read_structure, run_unfolding
+from phunfold.plot import plot_unfolded
+
+be  = NativeBackend("POSCAR", "SPOSCAR", "FORCE_CONSTANTS")
+res = run_unfolding(be, read_structure("POSCAR_prim"), path="cubic",
+                    mapping_options=dict(species_map={"Sr": "Ba"},
+                                         allow_vacancies=True),
+                    projections={"defect": "sphere:0.5,0.5,0.5:3.0"},
+                    resolve="species")
+plot_unfolded(res, style="scatter", color_by="defect", units="cm-1")
+plot_unfolded(res, style="spectral", weights=res.extra["w_O"])  # O-sublattice part
+```
+
+Your own eigenvectors, for example from another code or a model Hamiltonian:
+
+```python
+from phunfold import CallableBackend, run_unfolding
+backend = CallableBackend(structure, lambda k: my_solver(k))  # -> (freqs, eigvecs)
+res = run_unfolding(backend, reference, path="hexagonal", gauge="R")
+```
 
 ---
 
 ## Theory (what the code computes)
 
 Let the supercell contain N = |det M| reference cells, with
-`supercell.lattice = M @ reference.lattice` (lattice vectors as rows). Each
-supercell atom s is assigned to a reference sublattice κ(s) and an ideal site
-x_s = R_s + τ_κ (nearest site of the same species). For a supercell mode J with
-r-gauge eigenvector e_{sα}(K,J) — phonopy's convention, phase
-exp(2πi K·(r_t − r_s)) in D(K) — the weight on reference wave vector k is
+`supercell.lattice = M @ reference.lattice` (lattice vectors as rows, after
+any rotation). Each supercell atom s is assigned to a reference sublattice
+κ(s) and an ideal site x_s = R_s + τ_κ: the nearest site of a compatible
+species. For a supercell mode J with r-gauge eigenvector e_{sα}(K,J)
+(phonopy's convention: phase exp(2πi K·(r_t − r_s)) in D(K)), the weight on
+reference wave vector k is
 
     W_J(k) = (1/N) Σ_κ Σ_α | Σ_{s∈κ} e_{sα}(K,J) · exp(2πi [K·r_s − k·x_s]) |²
 
 (Allen et al., PRB 87, 085322 (2013); phonon form: Ikeda et al., PRB 95,
-024305 (2017), the method behind `phonopy.unfolding`). Two implementation
-choices:
+024305 (2017), the method behind `phonopy.unfolding`). Implementation choices:
 
-* **D is diagonalised at K = k itself** (the supercell dynamical matrix is
-  defined for any wave vector), so there is no need to fold k into the
-  supercell BZ and find G. The phase reduces to exp(2πi k·(r_s − x_s)): only
-  each atom's small displacement from its ideal site enters.
-* That displacement phase is **kept** by default. For a perfectly periodic
-  crystal whose atoms sit off the ideal sites it makes the weights exactly 0/1;
-  `phonopy.unfolding` drops it (`--no-distortion-phase` reproduces that).
-  The difference is O(k·δ), about 1 % here.
+* **D is diagonalised at K = k itself.** The supercell dynamical matrix is
+  defined for any wave vector, so k never has to be folded and no G has to be
+  searched for. The phase reduces to exp(2πi k·(r_s − x_s)), which only
+  involves each atom's small displacement from its ideal site.
+* **The displacement phase is kept** by default. For a periodic crystal whose
+  atoms sit off the ideal sites, it makes the weights exactly 0/1.
+  `phonopy.unfolding` drops it (`--no-distortion-phase` reproduces that); the
+  difference is O(k·δ).
+* **Sublattice decomposition:** W_J = Σ_κ W_Jκ. `--resolve` stores these per
+  sublattice or per reference species. A substituent counts toward the
+  sublattice it occupies, so the "Ba" panel includes Sr on Ba sites.
+* **Vacancies** are empty sites. **Interstitials** form one-atom ghost
+  sublattices, so their weight spreads uniformly over k.
 
-Checks built into every run: 0 ≤ W ≤ 1 and Σ_J W_J(k) = 3 × (atoms in the
-reference cell) = 15, printed as `sum-rule error`.
+Built-in checks: 0 ≤ W ≤ 1 and Σ_J W_J(k) = 3·n_atoms/N (= 3·n_ref without
+vacancies or interstitials). This is printed as `sum rule … holds to …`.
 
 Plotted quantity: A(k, ω) = Σ_J W_J(k) L(ω − ω_J), with L a Lorentzian of width
-`--sigma`. With `dw_info.json` present, each mode also gets
-`wall_participation` (fraction of Σ|e|² on atoms within `--wall-width` Å of a
-wall) and an inverse participation ratio.
+`--sigma`. Each `--project` group adds a panel of fat bands coloured by the
+fraction of |e|² on that group. An inverse participation ratio per mode is
+always stored.
 
 ---
 
-## Step-by-step VASP workflow
+## Worked example: BaTiO3 domain walls with VASP (step by step)
 
 The example commands use phonopy ≥ 4 syntax. **phonopy 4.0 (May 2026) split
 the CLI:** setup steps (`-d`, `--rd`, `-f`, `--fz`) moved to `phonopy-init`.
@@ -129,11 +252,8 @@ phunfold build-dw --bulk POSCAR_bulk --ncells 4 --normal a --lateral 1 1 --offse
 * `--width w` gives a tanh starting profile; 0 (abrupt) is fine because the
   relaxation sets the real profile.
 * **Other walls** (90° {101} walls, inclined walls, cells from MD or other
-  tools): the unfolding does not need `build-dw`. Any supercell works if its
-  lattice is an integer combination of the reference lattice (non-diagonal M is
-  supported and tested) and every atom lies within `max_displacement`
-  (default 0.8 Å) of an ideal site. Pass `--supercell-matrix` if
-  auto-detection fails. For 90° walls, pick a reference cell and orientation
+  tools): the unfolding does not need `build-dw`; see *Quick start* for the
+  general case (any integer M, rotated/shifted cells, defects). For 90° walls, pick a reference cell and orientation
   that are commensurate with both domains (for example a pseudocubic cell) and
   accept that the weights then mix two tetragonal orientations.
 
@@ -208,12 +328,12 @@ phunfold unfold --unitcell POSCAR --sposcar SPOSCAR --fc FORCE_CONSTANTS \
 ```
 
 Outputs: `unfolded.png` (left: A(k,ω) with the bulk bands dashed; right: fat
-bands colour-coded by wall participation), `unfolded.npz` (everything, re-plot
+bands colour-coded by the fraction of each mode on the wall atoms, from the `wall` projection that `dw_info.json` adds), `unfolded.npz` (everything, re-plot
 with `phunfold plot unfolded.npz --ylim 0 800 --units cm-1`) and `unfolded.dat`
-(x, q, ω, W, wall participation per line, for your own plotting).
+(x, q, ω, W and every projection per line, for your own plotting).
 
 * **k-path:** the default is
-  `Γ–X–M–Γ–Y | Γ–Z–R–A–Z` in reference reduced coordinates.
+  `dw-tetragonal`, i.e. `Γ–X–M–Γ–Y | Γ–Z–R–A–Z` in reference reduced coordinates.
   **X = (½,0,0) lies along the wall normal and Y = (0,½,0) in the wall plane.
   They are no longer equivalent in the DW cell, so always compare the two.**
   Z is the polar axis. Pass your own path with
@@ -225,7 +345,7 @@ with `phunfold plot unfolded.npz --ylim 0 800 --units cm-1`) and `unfolded.dat`
   The bulk OUTCAR atom order must match `POSCAR_bulk`.
 * **Interpreting the plot:** bulk-like modes follow the dashed bulk bands with
   weight ≈ 1. Wall-localised modes are dispersionless along X, carry a
-  reduced, spread-out weight, and show high `wall_participation`. A mode
+  reduced, spread-out weight, and a large fraction on the `wall` projection. A mode
   localised in one plane has no definite k⊥, so its weight is smeared over the
   whole Γ–X line by construction. Imaginary frequencies are plotted as negative.
 
@@ -255,23 +375,30 @@ with `phunfold plot unfolded.npz --ylim 0 800 --units cm-1`) and `unfolded.dat`
 * Native dynamical matrix from text FORCE_CONSTANTS + SPOSCAR reproduces the
   exact D(k) to 1e-13 THz, including minimum-image ties (multiplicity up to 8)
   where the force-constant range equals half the supercell.
+`tests/test_general.py` covers the general-supercell features:
+
+* Supercells randomly rotated and origin-shifted relative to the reference,
+  with a polar basis and anisotropic force constants so that a wrong
+  orientation would give wrong frequencies. The search recovers an orientation
+  that reproduces the primitive dispersion exactly.
+* Substitution (Sr on Ba) via `species_map` and via `match_species=False`;
+  O vacancy (sum rule 3·39/8); H interstitial (sum rule 3·41/8).
+* Reference cell built from the supercell average gives exact unfolding.
+  R-gauge eigenvectors give the same weights as r-gauge ones.
+  Sublattice-resolved weights sum to the total.
+* Projections (species, slab, sphere) and species resolution through
+  `run_unfolding`; fcc preset coordinates; supercell path frame.
+* Force-constant pruning (same frequencies from about 12 % of the pairs) and
+  mass overrides.
+
 * `examples/toy_dw_demo.py` runs the complete file-based CLI path (build-dw →
   SPOSCAR/FORCE_CONSTANTS → unfold → plot) on a wall with softened Ti–O bonds
   and recovers bulk-like branches plus flat wall-localised modes.
+* `examples/toy_defect_demo.py` runs a 3×3×3 cell with an Sr substitution and
+  an O vacancy, rotated 30° and shifted relative to the reference file, through
+  the CLI. The orientation search, vacancy, species map, defect projection and
+  species-resolved panels all work, and the Sr resonance mode stands out.
 
 Not tested here: the phonopy backend and the OUTCAR parser against real VASP
 output. They follow phonopy's documented API and VASP's OUTCAR layout, but
 check them on your first real run (step 8).
-
-## Python API
-
-```python
-from phunfold import NativeBackend, read_poscar, run_unfolding
-from phunfold.plot import plot_unfolded
-
-be  = NativeBackend("POSCAR", "SPOSCAR", "FORCE_CONSTANTS")
-res = run_unfolding(be, read_poscar("POSCAR_bulk"),
-                    "G 0 0 0, X 1/2 0 0, M 1/2 1/2 0, G 0 0 0",
-                    wall_axis=0, wall_positions=[0.0, 0.5], wall_width=2.5)
-plot_unfolded(res, style="scatter", color_by="wall_participation", units="cm-1")
-```

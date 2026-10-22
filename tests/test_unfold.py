@@ -15,7 +15,8 @@ sys.path.insert(0, HERE)
 
 from phunfold import (NativeBackend, Unfolder, run_unfolding,  # noqa: E402
                       write_poscar, read_poscar, make_band_path,
-                      parse_path_string, DEFAULT_PATH)
+                      parse_path_string, DEFAULT_PATH,
+                      resolve_path)
 from toymodel import perovskite, tile, ToyBackend, write_fc  # noqa: E402
 
 rng = np.random.default_rng(7)
@@ -126,7 +127,9 @@ def test_native_backend_roundtrip():
 
 def test_path():
     prim = perovskite()
-    p = make_band_path(parse_path_string(DEFAULT_PATH), prim.recip, 40)
+    p = make_band_path(resolve_path(DEFAULT_PATH, None, prim.lattice,
+                                    prim.lattice, prim.lattice),
+                       prim.recip, 40)
     assert p["labels"] == ["Γ", "X", "M", "Γ", "Y|Γ", "Z", "R", "A", "Z"]
     assert np.allclose(p["q"][0], 0) and np.allclose(p["q"][-1], [0, 0, .5])
 

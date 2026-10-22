@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+# toy demo outputs (regenerate with python examples/toy_dw_demo.py)
+examples/toy_run/*
+!examples/toy_run/unfolded_toy.png
+examples/toy_defect/*
+!examples/toy_defect/unfolded_defect.png
+# VASP / phonopy run files
+WAVECAR
+CHGCAR
+CHG
+vasprun.xml
+OUTCAR
+POTCAR
+
+# macOS
+.DS_Store
+**/.DS_Store
