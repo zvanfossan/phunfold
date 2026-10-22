@@ -43,11 +43,44 @@ def read_born(filename):
     if name.endswith(".xml"):
         born, eps = _read_vasprun_born(name)
     else:
-        from .vasp import parse_outcar_born
         born, eps = parse_outcar_born(name)
     born = np.asarray(born, float)
     born -= born.mean(axis=0)[None]
     return born, np.asarray(eps, float)
+
+
+def parse_outcar_born(outcar="OUTCAR"):
+    """Return (born (natoms,3,3), eps_inf (3,3)) from a LEPSILON run.
+
+    Uses the LAST 'BORN EFFECTIVE CHARGES' block and the last
+    'MACROSCOPIC STATIC DIELECTRIC TENSOR (including local field effects'
+    block (electronic eps_inf, not the ionic contribution).
+    Rows of each 3x3 Z* are the field direction as printed by VASP
+    (phonopy-vasp-born uses the same convention).
+    """
+    with open(outcar) as fh:
+        lines = fh.readlines()
+    born_start = eps_start = None
+    for i, ln in enumerate(lines):
+        if "BORN EFFECTIVE CHARGES" in ln:
+            born_start = i
+        if ("MACROSCOPIC STATIC DIELECTRIC TENSOR" in ln
+                and "including local field effects" in ln
+                and "IONIC" not in ln):
+            eps_start = i
+    if born_start is None or eps_start is None:
+        raise ValueError(f"{outcar}: Born charges / dielectric tensor not found")
+    eps = np.array([[float(x) for x in lines[eps_start + 2 + r].split()[:3]]
+                    for r in range(3)])
+    born, i = [], born_start + 2
+    while i < len(lines) and lines[i].split()[:1] == ["ion"]:
+        z = [[float(x) for x in lines[i + 1 + r].split()[1:4]] for r in range(3)]
+        born.append(z)
+        i += 4
+    born = np.array(born)
+    # enforce charge neutrality (small DFPT residuals)
+    born -= born.mean(axis=0)[None]
+    return born, eps
 
 
 def _read_vasprun_born(filename):
@@ -146,7 +179,8 @@ class GonzeNAC:
         return d0.sum(axis=2)                                # (n, 3, 3)
 
     def dynamical_matrix(self, q, direction=None):
-        """Unweighted D_dd(q) in eV/A^2, shape (n, 3, n, 3)."""
+        """Unweighted D_dd(q) in eV/A^2, shape (n, 3, n, 3). ``direction``
+        is only used for a term with q + G = 0 (the non-analytic limit)."""
         d = self._sum(np.asarray(q, float), direction)
         n = self.structure.natoms
         d[np.arange(n), :, np.arange(n), :] -= self._q0

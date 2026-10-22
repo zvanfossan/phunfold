@@ -249,3 +249,35 @@ if __name__ == "__main__":
             print(name)
             fn()
     print("ALL TESTS PASSED")
+
+
+def test_builders_and_disp_dirs():
+    from phunfold.builders import perovskite, make_disp_dirs
+    from phunfold.paths import detect_preset
+    from phunfold.domainwall import build_180_wall
+    cub = perovskite(4.0)
+    assert detect_preset(cub.lattice) == "cubic" and cub.natoms == 5
+    tet = perovskite(3.99, c=4.03, polar_axis="c",
+                     disp={"B": 0.1, "X_ap": -0.08, "X_eq": -0.06})
+    assert detect_preset(tet.lattice) == "tetragonal"
+    z = tet.cart[:, 2]
+    assert np.isclose(z[1], 4.03 / 2 + 0.1)              # Ti up
+    assert np.isclose(z[4] % 4.03, 4.03 - 0.08)           # apical O down
+    # the polar cell feeds straight into the domain-wall builder
+    dw, info = build_180_wall(tet, ncells=3)
+    assert dw.natoms == 30 and info["supercell_matrix"][0][0] == 6
+    with tempfile.TemporaryDirectory() as tmp:
+        sp = make_supercell(cub, np.diag([2, 2, 2]))
+        write_poscar(sp, f"{tmp}/SPOSCAR")
+        for i in (1, 2, 10):
+            write_poscar(sp, f"{tmp}/POSCAR-{i:03d}")
+        for name in ("INCAR_static", "submit.sh"):
+            open(f"{tmp}/{name}", "w").write("x\n")
+        made = make_disp_dirs(tmp, copy=[f"{tmp}/INCAR_static:INCAR",
+                                         f"{tmp}/submit.sh"])
+        names = sorted(os.path.basename(m) for m in made)
+        assert names == ["disp-001", "disp-002", "disp-010", "perfect"]
+        assert sorted(os.listdir(f"{tmp}/disp-010")) == ["INCAR", "POSCAR",
+                                                         "submit.sh"]
+    print("  perovskite (cubic/polar) -> build-dw chain OK; disp-dirs makes "
+          "perfect + disp-NNN with your files")

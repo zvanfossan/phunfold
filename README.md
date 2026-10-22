@@ -3,17 +3,210 @@
 phunfold takes the phonons of a large supercell and **unfolds** them onto the
 Brillouin zone of a small reference cell. Each supercell mode gets a weight
 for how much it looks like a reference-cell Bloch wave at k. The result is an
-effective band structure where bulk-like branches stay sharp and features from
-broken translational symmetry show up as extra or smeared spectral weight.
-Typical uses:
+effective band structure: bulk-like branches stay sharp, and anything caused
+by broken translational symmetry (domain walls, interfaces, defects, disorder)
+shows up as extra or smeared spectral weight.
 
-* **extended defects**: domain walls, interfaces, stacking faults, surfaces/slabs
-* **point defects**: vacancies, substitutions, interstitials
-* **disorder**: alloys and special quasirandom structures, mass disorder and isotopes
-* **distortions**: relaxed, rattled, or ML-MD snapshot cells; octahedral tilts
-  (unfold onto the untilted cell)
+phunfold builds the POSCAR files for each step, then reads phonopy's output
+and does the unfolding and plotting. VASP runs with **your own**
+INCAR/KPOINTS/POTCAR/job script. phonopy generates the displacements and
+collects the forces. The unfolding engine itself is pure NumPy and includes
+the LO–TO (non-analytical) correction for polar materials.
 
-What the supercell may differ in, relative to the reference:
+```
+phunfold perovskite   cubic or polar/tetragonal ABX3 starting POSCAR
+phunfold build-dw     180° domain-wall supercell POSCAR from a relaxed polar cell
+phunfold supercell    any cell × integer matrix (test cells, rattled cells)
+phunfold disp-dirs    perfect/ + disp-NNN/ folders after `phonopy -d`, with your input files copied in
+phunfold check        verify the whole chain in a bulk phonon folder (PASS/FAIL)
+phunfold unfold       unfold a supercell onto a reference cell and plot
+phunfold plot         re-plot a saved result
+phunfold presets      list k-path presets
+```
+
+## Install
+
+```bash
+git clone git@github.com:zvanfossan/phunfold.git
+cd phunfold
+python -m pip install --user -e .     # or into a conda/venv environment
+python tests/test_unfold.py && python tests/test_general.py && python tests/test_nac.py
+```
+
+phonopy has to be installed in the same Python (`python -m pip install --user
+phonopy`). On Python 3.9, pip installs phonopy 2.x, which uses the command
+names shown below; for phonopy ≥ 4 see the table at the end of this section.
+
+---
+
+## Workflow: BaTiO3, from bulk to a domain wall
+
+The layout below is a suggestion. Each `relax`, `born` and `phonon` folder is
+an ordinary VASP or phonopy folder that you fill with your own inputs.
+
+```
+BTO/
+  inputs/           INCAR_relax, INCAR_static, INCAR_born, KPOINTS_*, POTCAR, submit.sh
+  cubic/  relax/  born/  phonon/
+  tet/    relax/  born/  phonon/
+  dw/     relax/  phonon/
+```
+
+Settings that matter for phonons (use the same functional, ENCUT and PAW set
+everywhere): PBEsol (`GGA = PS`) for BaTiO3, `EDIFF = 1E-8`,
+`PREC = Accurate`, `LREAL = .FALSE.`, `ADDGRID = .TRUE.`. Relaxations need
+tight forces (`EDIFFG = -1E-3` or tighter). Static force runs use
+`IBRION = -1`, `NSW = 0`. The Born run uses `LEPSILON = .TRUE.`,
+`IBRION = 8`, without `NCORE`/`NPAR`. Scale the k-mesh inversely with cell
+size.
+
+### 1. Cubic BaTiO3: structure, relaxation, Born charges
+
+```bash
+cd BTO/cubic
+phunfold perovskite --a 4.00 --out relax/POSCAR
+# relax/: run VASP (ISIF = 3), rerun once from CONTCAR
+cp relax/CONTCAR born/POSCAR          # born/: run the LEPSILON calculation
+```
+
+### 2. Cubic phonons
+
+```bash
+cd phonon
+cp ../relax/CONTCAR POSCAR
+phonopy -d --dim 2 2 2 --pa P -c POSCAR          # SPOSCAR, POSCAR-001 ...
+phunfold disp-dirs --copy ../../inputs/INCAR_static:INCAR ../../inputs/KPOINTS_222:KPOINTS \
+                          ../../inputs/POTCAR ../../inputs/submit.sh
+#   SOURCE:NAME copies a file under a new name; plain paths keep their name
+for d in disp-*; do (cd $d && sbatch submit.sh); done
+# when all are finished:
+phonopy -f disp-*/vasprun.xml                    # -> FORCE_SETS
+```
+
+### 3. Check the whole chain (no extra DFT)
+
+```bash
+phunfold check --born ../born/vasprun.xml
+```
+
+`check` treats phonopy's 40-atom SPOSCAR as a supercell and unfolds it onto
+your 5-atom POSCAR. It then compares the result with the 5-atom dispersion
+computed from the same force constants. The two must agree exactly, and
+`check` prints **PASS** or **FAIL**. `check.png` shows the 120 folded supercell
+branches next to the 15 unfolded ones. Run it first in every bulk phonon
+folder: it tests the files, the atom mapping, the k-path and the LO–TO
+correction together.
+
+* `FORCE_CONSTANTS` is written automatically from `FORCE_SETS` (phunfold calls
+  `phonopy-load --writefc --full-fc`) when it is missing.
+* The k-path is picked from the lattice (`cubic` here); change it with
+  `--path`.
+* `--born` takes the `vasprun.xml` (or `OUTCAR`) of the LEPSILON run directly.
+  No BORN file is needed.
+
+**What to expect for cubic BaTiO3:** imaginary (negative) branches at Γ and
+along Γ–X–M. That's the ferroelectric instability of the cubic phase. R is
+stable, and the LO mode near 650 cm⁻¹ sits at Γ. A 2×2×2 supercell is a first
+pass; converge the force constants with 3×3×3 or 4×4×4.
+
+phonopy's own plot, for comparison (it needs a BORN file:
+`phonopy-vasp-born ../born/vasprun.xml > BORN`):
+
+```bash
+env MPLBACKEND=Agg phonopy-load --band "0 0 0  0 1/2 0  1/2 1/2 0  0 0 0  1/2 1/2 1/2  0 1/2 0" \
+    --band-labels '$\Gamma$ X M $\Gamma$ R X' -p -s
+```
+
+### 4. Tetragonal P4mm, the reference cell for the domain wall
+
+```bash
+cd BTO/tet
+phunfold perovskite --a 3.99 --c 4.03 --polar-axis c \
+                    --disp B=0.10 X_ap=-0.08 X_eq=-0.06 --out relax/POSCAR
+# relax/ (ISIF = 3, keep symmetry; rerun from CONTCAR), then born/ as in step 1
+cd phonon && cp ../relax/CONTCAR POSCAR
+phonopy -d --dim 2 2 2 --pa P -c POSCAR          # (3 3 3 for production)
+phunfold disp-dirs --copy ...                    # as in step 2, run, then
+phonopy -f disp-*/vasprun.xml
+phunfold check --born ../born/vasprun.xml        # path: 'tetragonal'
+```
+
+Check that c/a is about 1.01 and Ti sits about 0.1 Å off-centre. Some soft
+or slightly imaginary in-plane (E) modes are normal: at 0 K, DFT tetragonal
+BaTiO3 is itself unstable toward polarization rotation.
+
+### 5. The 180° domain wall
+
+```bash
+cd BTO/dw
+phunfold build-dw --bulk ../tet/relax/CONTCAR --ncells 4 --normal a --offset 0
+#   -> POSCAR_DW (40 atoms, 8 cells along a) and dw_info.json
+cp POSCAR_DW relax/POSCAR      # relax/: ions only (ISIF = 2), forces < ~5e-4 eV/A
+cd phonon
+cp ../relax/CONTCAR POSCAR
+phonopy -d --dim 1 2 2 --pa P -c POSCAR
+phunfold disp-dirs --copy ...                    # run all, then
+phonopy -f disp-*/vasprun.xml
+phunfold unfold --reference ../../tet/relax/CONTCAR \
+                --born ../../tet/born/vasprun.xml \
+                --bulk-dir ../../tet/phonon --dw-info ../dw_info.json \
+                --out dw_unfolded
+```
+
+* `--reference` is the cell to unfold onto, the relaxed tetragonal 5-atom
+  cell.
+* `--born` should come from the **tetragonal** LEPSILON run. Its charges are
+  copied onto every wall atom by sublattice.
+* `--bulk-dir` draws the tetragonal bulk bands, dashed, with the same NAC.
+* `--dw-info` adds a `wall` projection, and selects the `dw-tetragonal` path
+  automatically.
+
+Build-dw options:
+* `--offset 0` gives the Ba-centred wall (the low-energy one in BaTiO3), and
+  `--offset 0.5` the Ti-centred one.
+* `--ncells` sets the wall separation.
+* `--lateral` repeats the cell in the wall plane.
+
+The code refuses P ∥ wall normal (a charged head-to-head wall) unless you pass
+`--allow-charged`.
+
+**Reading `dw_unfolded.png`:**
+- **Left panel:** the unfolded spectral function. Bulk-like modes follow the
+  dashed tetragonal bands with weight ≈ 1.
+- **Right panel:** each mode coloured by its fraction on atoms within 2.5 Å of
+  a wall (`--wall-width`).
+- **Wall-localised modes** are dispersionless along Γ–X (X is normal to the
+  wall), carry reduced, smeared weight, and are bright in the right panel.
+  They can disperse along Γ–Y, which lies in the wall plane.
+
+Converge the wall-mode frequencies with `--ncells 6` and `--dim 1 3 3`.
+
+### Commands for phonopy ≥ 4
+
+phonopy 4.0 (May 2026, Python ≥ 3.11) moved the setup steps to `phonopy-init`:
+
+| phonopy 2.x / 3.x (above) | phonopy ≥ 4 |
+|---|---|
+| `phonopy -d --dim … --pa P -c POSCAR` | `phonopy-init -d --dim … --pa P -c POSCAR` |
+| `phonopy -f disp-*/vasprun.xml` | `phonopy-init -f disp-*/vasprun.xml` |
+| `phonopy-load --band …` | `phonopy --band …` |
+
+phunfold works with both. Its automatic FORCE_CONSTANTS step tries
+`phonopy-load` first and then `phonopy`.
+
+---
+
+## Beyond domain walls: unfolding any supercell
+
+Same pattern: displacements on the supercell with phonopy, forces from any
+code phonopy supports, then
+
+```bash
+phunfold unfold --reference POSCAR_prim [options]
+```
+
+with `POSCAR`, `SPOSCAR` and `FORCE_SETS`/`FORCE_CONSTANTS` in the current
+folder.
 
 | Supercell differs from the reference by… | Handled by |
 |---|---|
@@ -23,93 +216,26 @@ What the supercell may differ in, relative to the reference:
 | Atomic displacements up to `--max-displacement` (default 0.8 Å) | displacement phase, exact for periodic distortions |
 | Substitutions | `--species-map Sr=Ba,Zr=Ti` or `--any-species` |
 | Vacancies / interstitials | `--allow-vacancies` / `--allow-interstitials` |
-| No clean reference cell (alloys) | `--reference auto`: average structure of the supercell |
-
-Force constants can come from any code phonopy interfaces with (VASP, QE,
-ABINIT, CP2K, CASTEP, FHI-aims, ML potentials…) through phonopy's
-`FORCE_CONSTANTS`/`force_constants.hdf5`. You can also plug in your own
-eigen-solver (`CallableBackend`, `DynamicalMatrixBackend`), with eigenvectors in
-the r-gauge or the R-gauge (`gauge="R"`).
-
-The unfolding engine is pure NumPy. phonopy is only needed to generate
-displacements and turn forces into force constants.
-
-```
-phunfold/
-  phunfold/structure.py    POSCAR I/O (other formats via ASE), supercells, masses
-  phunfold/lattice.py      supercell-matrix / orientation search, average reference cell
-  phunfold/mapping.py      atom -> site mapping (origin, substitutions, vacancies, interstitials)
-  phunfold/dynmat.py       dynamical matrix: native (FORCE_CONSTANTS), phonopy, or user callable
-  phunfold/unfold.py       unfolding weights (total / sublattice-resolved), pipeline, results
-  phunfold/paths.py        k-path presets and coordinate frames
-  phunfold/projections.py  atom groups: species, indices, sites, slabs, spheres, defects
-  phunfold/plot.py         spectral-function and fat-band plots
-  phunfold/domainwall.py   180° domain-wall builder (worked example)
-  phunfold/vasp.py         VASP inputs per stage, displacement dirs, OUTCAR Born parser
-  phunfold/__main__.py     CLI: phunfold {unfold, plot, supercell, presets, build-dw, setup, setup-disp}
-  tests/                   exact validation against a toy perovskite force field
-  examples/                end-to-end dry runs (domain wall; rotated defect cell) + SLURM script
-```
-
-Install: `pip install -e .` (add `phonopy` to the same environment for
-force-constant generation; `ase` and `h5py` are optional).
-
----
-
-## Quick start: unfolding any supercell
-
-You need three things:
-
-1. **The supercell** whose phonons you want. Its force constants come from
-   phonopy's usual route: displacements on the supercell (`--dim` for extra
-   repetitions if needed), forces from your code, `FORCE_CONSTANTS` with
-   `--full-fc`.
-2. **The reference cell** to unfold onto: a small cell with the same lattice
-   type and basis. It doesn't need the same orientation, origin, atom order, or
-   exact lattice constants.
-3. **A k-path** in the reference cell's coordinates: a preset or your own.
+| No clean reference cell (alloys, SQS) | `--reference auto --supercell-matrix "4 4 4"` |
 
 ```bash
-phunfold unfold --unitcell POSCAR --sposcar SPOSCAR --fc FORCE_CONSTANTS \
-                --reference POSCAR_prim --path cubic --out unfolded
+# substitution + vacancy, flag modes localised around the defect, split by species
+phunfold unfold --reference POSCAR_prim --species-map Sr=Ba --allow-vacancies \
+    --project defect=sphere:0.5,0.5,0.5:3.0 Sr=species:Sr --resolve species
+
+# interface or stacking fault at fractional 0 and 0.5 along lattice vector 0
+phunfold unfold --reference POSCAR_prim --project interface=slab:0:0,0.5:2.5
+
+# custom path, in supercell coordinates; isotopes; very large cells; QE units
+phunfold unfold --reference POSCAR_prim --path "G 0 0 0, X 1/2 0 0" --path-frame supercell
+phunfold unfold --reference POSCAR_prim --mass O=17.999 --fc-threshold 1e-4 --fc-units Ry/bohr^2
 ```
 
-Common variations:
-
-```bash
-# substitutional alloy, with Sr and Zr on the Ba and Ti sites; species-resolved spectra
-phunfold unfold ... --species-map Sr=Ba,Zr=Ti --resolve species
-
-# vacancy + substitution; flag modes localised around the defect
-phunfold unfold ... --allow-vacancies --species-map Sr=Ba \
-                    --project defect=sphere:0.5,0.5,0.5:3.0 Sr=species:Sr
-
-# interface / domain wall / stacking fault at fractional 0 and 0.5 along lattice vector 0
-phunfold unfold ... --project interface=slab:0:0,0.5:2.5
-
-# no clean reference cell (e.g. SQS): use the average structure of a 4x4x4 cell
-phunfold unfold ... --reference auto --supercell-matrix "4 4 4" --any-species
-
-# path in supercell coordinates, or Cartesian (1/Å, reference-file frame)
-phunfold unfold ... --path "G 0 0 0, X 1/2 0 0" --path-frame supercell
-
-# polar material: LO-TO splitting from a VASP LEPSILON run (this cell or the reference cell)
-phunfold unfold ... --born ../born/vasprun.xml
-
-# isotopes, very large cells, Quantum ESPRESSO force constants
-phunfold unfold ... --mass O=17.999 --fc-threshold 1e-4 --fc-units Ry/bohr^2
-```
-
-`phunfold presets` lists the built-in paths: `cubic`, `tetragonal`,
-`orthorhombic`, `hexagonal` (γ = 120°), `fcc`, `bcc` (Setyawan–Curtarolo
-labels), and `dw-tetragonal`. The fcc and bcc presets are defined in Cartesian
-cubic-axis units, so they work with any primitive-vector convention as long as
-the cubic axes of your reference file lie along x, y, z.
-
-`phunfold supercell --reference POSCAR_prim --matrix "2 2 2" --rattle 0.01`
-builds test supercells. The best validation of a new setup is to unfold a
-defect-free supercell made this way: every weight must be 0 or 1, on top of
-the primitive bands.
+Projection specs: `species:Ti,O`, `atoms:0-19`, `sites:0`,
+`slab:AXIS:F1,F2:WIDTH`, `sphere:F1,F2,F3:RADIUS`, `interstitials`,
+`substituted`. Path presets (`phunfold presets`): `cubic`, `tetragonal`,
+`orthorhombic`, `hexagonal`, `fcc`, `bcc`, `dw-tetragonal`. `--path auto`, the
+default, picks one from the reference lattice.
 
 ### Orientation choices
 
@@ -123,30 +249,6 @@ strain), equivalent orientations give physically different path directions,
 for example X normal to a wall versus X in its plane. The code warns when
 that ambiguity exists; fix it with `--supercell-matrix` or by writing both
 cells in the same orientation.
-
-### Python API
-
-```python
-from phunfold import NativeBackend, read_structure, run_unfolding
-from phunfold.plot import plot_unfolded
-
-be  = NativeBackend("POSCAR", "SPOSCAR", "FORCE_CONSTANTS")
-res = run_unfolding(be, read_structure("POSCAR_prim"), path="cubic",
-                    mapping_options=dict(species_map={"Sr": "Ba"},
-                                         allow_vacancies=True),
-                    projections={"defect": "sphere:0.5,0.5,0.5:3.0"},
-                    resolve="species")
-plot_unfolded(res, style="scatter", color_by="defect", units="cm-1")
-plot_unfolded(res, style="spectral", weights=res.extra["w_O"])  # O-sublattice part
-```
-
-Your own eigenvectors, for example from another code or a model Hamiltonian:
-
-```python
-from phunfold import CallableBackend, run_unfolding
-backend = CallableBackend(structure, lambda k: my_solver(k))  # -> (freqs, eigvecs)
-res = run_unfolding(backend, reference, path="hexagonal", gauge="R")
-```
 
 ---
 
@@ -212,191 +314,25 @@ always stored.
 
 ---
 
-## Worked example: BaTiO3 domain walls with VASP (step by step)
+## Python API
 
-The example commands use phonopy ≥ 4 syntax. **phonopy 4.0 (May 2026) split
-the CLI:** the setup steps moved to `phonopy-init`, and phonopy 4 needs
-Python ≥ 3.11. With phonopy 2.x/3.x (for example on a Python 3.9 cluster
-install), translate as follows:
+```python
+from phunfold import NativeBackend, read_structure, run_unfolding
+from phunfold.plot import plot_unfolded
+from phunfold.nac import read_born
 
-| phonopy ≥ 4 (used below) | phonopy 2.x / 3.x |
-|---|---|
-| `phonopy-init -d --dim … --pa P -c POSCAR` | `phonopy -d --dim … --pa P -c POSCAR` |
-| `phonopy-init --rd 150 --amplitude 0.03 …` | `phonopy --rd 150 --amplitude 0.03 …` |
-| `phonopy-init -f disp-*/vasprun.xml` | `phonopy -f disp-*/vasprun.xml` |
-| `phonopy-init --fz perfect/vasprun.xml -f disp-*/vasprun.xml` | see `phonopy -h` for `--fz` |
-| `phonopy --writefc --full-fc` | `phonopy-load --writefc --full-fc` |
-| `phonopy --band …` | `phonopy-load --band …` |
-
-All `phunfold` commands are the same for every phonopy version. phunfold
-needs `FORCE_CONSTANTS`, which phonopy writes only when asked (`--writefc`).
-
-### Step 0 — Convergence and settings (bulk 5-atom cell)
-
-| Setting | Recommendation for BaTiO3 |
-|---|---|
-| Functional | **PBEsol** (`GGA = PS`). PBE badly over-estimates tetragonality and the double-well depth. LDA under-binds. Stay consistent across all steps. |
-| PAW | `Ba_sv`, `Ti_sv` (or `Ti_pv`), `O` |
-| ENCUT | Converge stress/phonons; 550–650 eV is typical. Use the same value everywhere. |
-| k-mesh | 8×8×8 Γ-centred for the 5-atom cell (≈ `--kspacing 0.2` Å⁻¹). Scale inversely with cell length for supercells. |
-| Electronic | `EDIFF = 1E-8`, `PREC = Accurate`, `LREAL = .FALSE.`, `ADDGRID = .TRUE.`, `LASPH = .TRUE.`, `ISMEAR = 0`, `SIGMA = 0.02` |
-
-`phunfold setup` writes these defaults; override any tag with `--set TAG=VALUE`.
-
-### Step 1 — Relax the bulk polar cell
-
-```bash
-phunfold setup --stage relax_bulk --poscar POSCAR_P4mm --dir 01_bulk_relax \
-               --potcar-dir $VASP_PP/potpaw_PBE --potcar-variant Ba=Ba_sv Ti=Ti_sv
-# run VASP; copy CONTCAR -> POSCAR and run again (removes Pulay stress)
+born, eps = read_born("../born/vasprun.xml")               # for this cell's atoms
+be  = NativeBackend("POSCAR", "SPOSCAR", "FORCE_CONSTANTS",
+                    nac=dict(born=born, epsilon=eps))
+res = run_unfolding(be, read_structure("POSCAR_prim"), path="cubic",
+                    mapping_options=dict(species_map={"Sr": "Ba"}, allow_vacancies=True),
+                    projections={"defect": "sphere:0.5,0.5,0.5:3.0"}, resolve="species")
+plot_unfolded(res, style="scatter", color_by="defect", units="cm-1")
 ```
 
-Start from tetragonal P4mm with the **polar axis along c** (Ti and O displaced
-along z). Keep the standard setting (Ba at the origin). This CONTCAR,
-`POSCAR_bulk`, is the reference cell used for both building and unfolding.
-
-### Step 2 — Bulk reference phonons and Born charges (recommended)
-
-```bash
-# 2a: bulk phonons, used as the dashed overlay and as a sanity check
-mkdir 02_bulk_phonon && cd 02_bulk_phonon && cp ../POSCAR_bulk POSCAR
-phonopy-init -d --dim 4 4 4 --pa P -c POSCAR
-phunfold setup-disp --potcar-dir ... --potcar-variant Ba=Ba_sv Ti=Ti_sv
-#   run every disp-*/ (examples/run_displacements.slurm), then:
-phonopy-init -f disp-*/vasprun.xml
-phonopy --writefc --full-fc         # -> FORCE_CONSTANTS
-# 2b: Born effective charges + eps_inf, for LO-TO splitting (DFPT)
-phunfold setup --stage born --poscar POSCAR_bulk --dir 02_born   # IBRION=8, LEPSILON
-```
-
-For DFPT (`IBRION = 7/8`, `LEPSILON`), do **not** set `NCORE`/`NPAR`.
-
-### Step 3 — Build the domain-wall supercell
-
-```bash
-phunfold build-dw --bulk POSCAR_bulk --ncells 4 --normal a --lateral 1 1 --offset 0
-# -> POSCAR_DW (2 x 4 = 8 cells along a, 40 atoms) and dw_info.json
-```
-
-* This builds neutral **180° walls**: P ∥ c, wall normal along a. The code
-  refuses P ∥ normal, which gives charged head-to-head walls, unless you pass
-  `--allow-charged`.
-* `--offset 0` puts the wall on the BaO plane (Ba-centred, the low-energy
-  180° wall in BaTiO3). `--offset 0.5` puts it on the TiO2 plane, which is
-  worth computing to compare energies.
-* `--ncells` (cells per domain) sets the wall–wall separation. Converge it:
-  energy, relaxed profile and the localised-mode frequencies should not change
-  between, for example, 4 and 6.
-* `--width w` gives a tanh starting profile; 0 (abrupt) is fine because the
-  relaxation sets the real profile.
-* **Other walls** (90° {101} walls, inclined walls, cells from MD or other
-  tools): the unfolding does not need `build-dw`; see *Quick start* for the
-  general case (any integer M, rotated/shifted cells, defects). For 90° walls, pick a reference cell and orientation
-  that are commensurate with both domains (for example a pseudocubic cell) and
-  accept that the weights then mix two tetragonal orientations.
-
-### Step 4 — Relax the domain-wall supercell (ions only)
-
-```bash
-phunfold setup --stage relax_dw --poscar POSCAR_DW --dir 03_dw_relax --set NCORE=8 ...
-```
-
-* `ISIF = 2`: the lattice stays at the bulk tetragonal value, which is correct
-  for 180° walls because both domains have the same strain state.
-* **Tight forces: `EDIFFG = -1E-3` eV/Å or tighter.** Residual forces in a
-  shallow double-well system produce spurious imaginary branches. Check that
-  the final forces in OUTCAR are below about 5×10⁻⁴ eV/Å.
-* Check that the wall is still centred where you put it, and that Ti
-  displacements flip sign across it. Keep `dw_info.json` next to the relaxed
-  cell. It stores the wall planes in fractional coordinates; update it if a
-  wall migrated.
-
-Save the result: `cp 03_dw_relax/CONTCAR POSCAR_DW_relaxed`.
-
-### Step 5 — Finite displacements on the DW cell
-
-```bash
-mkdir 04_dw_phonon && cd 04_dw_phonon
-cp ../POSCAR_DW_relaxed POSCAR && cp ../dw_info.json .
-phonopy-init -d --dim 1 2 2 --pa P -c POSCAR      # -> SPOSCAR, POSCAR-001...
-phunfold setup-disp --kspacing 0.2 --potcar-dir ... --potcar-variant Ba=Ba_sv Ti=Ti_sv
-N=$(ls -d disp-* | wc -l); sbatch --array=0-$N ../examples/run_displacements.slurm
-```
-
-* **`--dim`:** the DW cell is already long along the normal (≥ 32 Å), but only
-  one cell (≈ 4 Å) wide laterally. Use at least ×2 laterally (≈ 8 Å);
-  ×3 (≈ 12 Å) is safer for BaTiO3's long-range polar force constants.
-  Compare against the bulk 4×4×4 run to judge convergence.
-* **Single-point INCAR** (`single_point` stage): `IBRION = -1`, `NSW = 0`,
-  `EDIFF = 1E-8`, `ISYM = 0`, `LREAL = .FALSE.`, `ADDGRID = .TRUE.`. To save
-  SCF steps, copy the perfect-cell WAVECAR into each directory and set
-  `ISTART = 1`.
-* `perfect/` is the undisplaced SPOSCAR. Its residual forces are subtracted with
-  `--fz` (step 6). Plus/minus displacements, phonopy's default where symmetry
-  requires them, also cancel most of the residual-force and anharmonic error.
-* **Cost-saving alternative for large, low-symmetry cells:** use random
-  displacements and a fitted force-constant solver instead of the systematic
-  set. For example `phonopy-init --rd 150 --amplitude 0.03 --dim 1 2 2 --pa P -c POSCAR`,
-  then `--fc-calculator symfc` when building FCs. This typically needs a small
-  fraction of the systematic displacement count. Check convergence against the
-  number of snapshots.
-* An accurately fine-tuned machine-learned potential can supply these forces
-  instead of VASP (phonopy works with any force source; `pypolymlp` is built
-  in). This makes larger walls and lateral dimensions affordable. Validate it
-  against a few DFT displacement sets first.
-
-### Step 6 — Forces → force constants
-
-```bash
-phonopy-init --fz perfect/vasprun.xml -f disp-*/vasprun.xml   # -> FORCE_SETS
-phonopy --writefc --full-fc                                   # -> FORCE_CONSTANTS
-```
-
-(The exact `--fz` argument order is version dependent; see `phonopy-init -h`.
-Without `--fz`: `phonopy-init -f disp-*/vasprun.xml`.) Use `--full-fc`; the
-native backend reads full or compact FCs, but full is robust to how phonopy
-chooses its primitive cell.
-
-### Step 7 — Unfold and plot
-
-```bash
-phunfold unfold --unitcell POSCAR --sposcar SPOSCAR --fc FORCE_CONSTANTS \
-                --reference ../POSCAR_bulk --dw-info dw_info.json \
-                --bulk-dir ../02_bulk_phonon --units cm-1 --out unfolded
-```
-
-Outputs: `unfolded.png` (left: A(k,ω) with the bulk bands dashed; right: fat
-bands colour-coded by the fraction of each mode on the wall atoms, from the `wall` projection that `dw_info.json` adds), `unfolded.npz` (everything, re-plot
-with `phunfold plot unfolded.npz --ylim 0 800 --units cm-1`) and `unfolded.dat`
-(x, q, ω, W and every projection per line, for your own plotting).
-
-* **k-path:** the default is
-  `dw-tetragonal`, i.e. `Γ–X–M–Γ–Y | Γ–Z–R–A–Z` in reference reduced coordinates.
-  **X = (½,0,0) lies along the wall normal and Y = (0,½,0) in the wall plane.
-  They are no longer equivalent in the DW cell, so always compare the two.**
-  Z is the polar axis. Pass your own path with
-  `--path "G 0 0 0, X 1/2 0 0 | ..."`.
-* **LO–TO splitting:** add `--born ../02_born/vasprun.xml` (or the
-  `OUTCAR` of that run). The bulk Born charges and ε∞ are tiled onto the DW
-  cell by sublattice, and the Gonze–Lee dipole–dipole correction is applied
-  (see *Non-analytical correction* above). The atom order of the LEPSILON run
-  must match `POSCAR_bulk`. With `--bulk-dir`, the dashed bulk overlay gets the
-  same correction.
-* **Interpreting the plot:** bulk-like modes follow the dashed bulk bands with
-  weight ≈ 1. Wall-localised modes are dispersionless along X, carry a
-  reduced, spread-out weight, and a large fraction on the `wall` projection. A mode
-  localised in one plane has no definite k⊥, so its weight is smeared over the
-  whole Γ–X line by construction. Imaginary frequencies are plotted as negative.
-
-### Step 8 — Validate (do this once on your own cluster)
-
-1. `python tests/test_unfold.py`: exact checks (below).
-2. **Unfold an unrelaxed, wall-free 8×1×1 bulk supercell** with the same
-   `--dim` as step 5. Every weight should be 0 or 1, and the unfolded bands
-   should coincide with step 2a. This tests the whole DFT + phonopy pipeline
-   on your files.
-3. Optionally cross-check against `phonopy.unfolding.Unfolding` with
-   `--no-distortion-phase`; the two should agree to numerical precision.
+Structures: `phunfold.builders.perovskite`, `phunfold.domainwall.build_180_wall`,
+`phunfold.make_supercell`, `phunfold.builders.make_disp_dirs`. Your own
+eigen-solver plugs in through `phunfold.CallableBackend(structure, fn)`.
 
 ---
 
@@ -414,6 +350,7 @@ with `phunfold plot unfolded.npz --ylim 0 800 --units cm-1`) and `unfolded.dat`
 * Native dynamical matrix from text FORCE_CONSTANTS + SPOSCAR reproduces the
   exact D(k) to 1e-13 THz, including minimum-image ties (multiplicity up to 8)
   where the force-constant range equals half the supercell.
+
 `tests/test_general.py` covers the general-supercell features:
 
 * Supercells randomly rotated and origin-shifted relative to the reference,
@@ -442,6 +379,10 @@ with `phunfold plot unfolded.npz --ylim 0 800 --units cm-1`) and `unfolded.dat`
   to 2·10⁻¹⁵, including LO–TO at Γ.
 * Born charges and ε∞ are read correctly from `vasprun.xml`.
 
+`tests/test_general.py` also checks the POSCAR builders (cubic and polar
+perovskite → domain wall) and `disp-dirs`. The `check` command applies the
+same exact-agreement test to your own data.
+
 * `examples/toy_dw_demo.py` runs the complete file-based CLI path (build-dw →
   SPOSCAR/FORCE_CONSTANTS → unfold → plot) on a wall with softened Ti–O bonds
   and recovers bulk-like branches plus flat wall-localised modes.
@@ -450,6 +391,8 @@ with `phunfold plot unfolded.npz --ylim 0 800 --units cm-1`) and `unfolded.dat`
   the CLI. The orientation search, vacancy, species map, defect projection and
   species-resolved panels all work, and the Sr resonance mode stands out.
 
-Not tested here: the phonopy backend and the OUTCAR parser against real VASP
-output. They follow phonopy's documented API and VASP's OUTCAR layout, but
-check them on your first real run (step 8).
+On real data: for cubic BaTiO3 (VASP, PBEsol, 2×2×2 supercell, LEPSILON Born
+charges), the phunfold dispersion with NAC matches phonopy's NAC band
+structure, and `phunfold check` passes. Not yet exercised on real output: the
+`--backend phonopy` path and reading Born charges from `OUTCAR`
+(`vasprun.xml` is the tested route).

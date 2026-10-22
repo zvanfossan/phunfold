@@ -24,24 +24,83 @@ def _decorate(ax, path, ylim, units):
     ax.set_ylabel(UNIT_LABEL[units])
 
 
-def _upsample(x, f, w, factor):
-    """Linearly interpolate (sorted) frequencies and weights between
-    neighbouring k-points so steep branches render as continuous lines in the
-    spectral map. Path breaks (repeated x) are not interpolated across."""
+def _match(fa, fb, max_jump, fa_pred=None):
+    """Greedy pairing of modes at two neighbouring k-points, closest first.
+    ``fa_pred`` (fa extrapolated along each branch's slope) keeps nearby
+    branches from swapping. Returns pairs and the unmatched indices."""
+    if len(fa) == 0 or len(fb) == 0:
+        return [], list(range(len(fa))), list(range(len(fb)))
+    ref = fa if fa_pred is None else fa_pred
+    d = np.abs(ref[:, None] - fb[None, :])
+    order = np.argsort(d, axis=None)
+    used_a, used_b, pairs = set(), set(), []
+    for flat in order:
+        i, j = divmod(int(flat), len(fb))
+        if d[i, j] > max_jump:
+            break
+        if i in used_a or j in used_b:
+            continue
+        used_a.add(i)
+        used_b.add(j)
+        pairs.append((i, j))
+    return (pairs, [i for i in range(len(fa)) if i not in used_a],
+            [j for j in range(len(fb)) if j not in used_b])
+
+
+def _upsample(x, f, w, factor, wmin=1e-3, max_jump=None):
+    """Display-only refinement of the spectral map between computed k-points.
+
+    Only modes that carry weight are interpolated, and each is paired with the
+    nearest-frequency weighted mode at the next k-point. A mode without a
+    partner fades out (or in) at constant frequency. Returns a list of
+    (x, freqs, weights) "pseudo k-points" with variable numbers of modes,
+    flattened into padded arrays (zero weight padding)."""
     if factor <= 1:
         return x, f, w
-    xs, fs, ws = [x[:1]], [f[:1]], [w[:1]]
+    span = np.ptp(f) if f.size else 1.0
+    max_jump = max_jump or 0.08 * span
+    xs, cols_f, cols_w = [], [], []
+
+    def add(xv, fv, wv):
+        xs.append(xv)
+        cols_f.append(np.asarray(fv, float))
+        cols_w.append(np.asarray(wv, float))
+
+    sel0 = w[0] > wmin
+    add(x[0], f[0][sel0], w[0][sel0])
+    slope = np.zeros(int(sel0.sum()))
     for i in range(len(x) - 1):
-        if x[i + 1] - x[i] <= 1e-12:
-            xs.append(x[i + 1:i + 2])
-            fs.append(f[i + 1:i + 2])
-            ws.append(w[i + 1:i + 2])
+        sa, sb = w[i] > wmin, w[i + 1] > wmin
+        fa, wa, fb, wb = f[i][sa], w[i][sa], f[i + 1][sb], w[i + 1][sb]
+        dx = x[i + 1] - x[i]
+        if dx <= 1e-12:                        # path break: no interpolation
+            add(x[i + 1], fb, wb)
+            slope = np.zeros(len(fb))
             continue
-        t = np.linspace(0, 1, factor + 1)[1:, None]
-        xs.append(x[i] + t[:, 0] * (x[i + 1] - x[i]))
-        fs.append(f[i] + t * (f[i + 1] - f[i]))
-        ws.append(w[i] + t * (w[i + 1] - w[i]))
-    return np.concatenate(xs), np.vstack(fs), np.vstack(ws)
+        pairs, ua, ub = _match(fa, fb, max_jump, fa + slope * dx)
+        new_slope = np.zeros(len(fb))
+        for a_, b_ in pairs:
+            new_slope[b_] = (fb[b_] - fa[a_]) / dx
+        slope = new_slope
+        pa = np.array([p[0] for p in pairs], int)
+        pb = np.array([p[1] for p in pairs], int)
+        for t in np.linspace(0, 1, factor + 1)[1:]:
+            ff = [fa[pa] + t * (fb[pb] - fa[pa]) if len(pairs) else []]
+            ww = [wa[pa] + t * (wb[pb] - wa[pa]) if len(pairs) else []]
+            # unmatched modes fade over the first / last half of the interval
+            fade_out = max(0.0, 1 - 2 * t)
+            fade_in = max(0.0, 2 * t - 1)
+            ff += [fa[ua], fb[ub]]
+            ww += [wa[ua] * fade_out, wb[ub] * fade_in]
+            add(x[i] + t * (x[i + 1] - x[i]), np.concatenate(ff),
+                np.concatenate(ww))
+    n = max(len(c) for c in cols_f)
+    F = np.zeros((len(xs), n))
+    W = np.zeros((len(xs), n))
+    for k, (cf, cw) in enumerate(zip(cols_f, cols_w)):
+        F[k, :len(cf)] = cf
+        W[k, :len(cw)] = cw
+    return np.array(xs), F, W
 
 
 def plot_unfolded(result, ax=None, style="spectral", units="THz", ylim=None,
@@ -79,9 +138,7 @@ def plot_unfolded(result, ax=None, style="spectral", units="THz", ylim=None,
     mappable = None
     if style in ("spectral", "both"):
         omega = np.linspace(ylim[0], ylim[1], n_omega)
-        xu, fu, wu = _upsample(x, np.sort(f, axis=1),
-                               np.take_along_axis(w, np.argsort(f, axis=1), 1),
-                               upsample)
+        xu, fu, wu = _upsample(x, f, w, upsample)
         a = spectral_function(fu, wu, omega, sigma=sigma)
         mappable = ax.pcolormesh(xu, omega, a, shading="gouraud",
                                  cmap=cmap or "Greys",

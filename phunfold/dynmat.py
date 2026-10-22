@@ -329,7 +329,7 @@ class PhonopyBackend:
             kwargs["born_filename"] = born  # phonopy BORN file for THIS cell
         self.phonon = phonopy.load(phonopy_yaml, **kwargs)
         if nac_params is not None:
-            # dict(born=(n_atoms, 3, 3), dielectric=(3, 3)); see vasp.tile_born
+            # dict(born=(n_atoms, 3, 3), dielectric=(3, 3)); see nac.tile_born
             self.phonon.nac_params = nac_params
         prim = self.phonon.primitive
         self.structure = Structure(prim.cell, prim.scaled_positions,

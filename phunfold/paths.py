@@ -178,3 +178,36 @@ def make_band_path(segments, recip, density=60.0, npts=None):
     return dict(q=q, k_cart=q @ recip, x=np.concatenate(xs),
                 ticks=np.array(ticks), labels=labels,
                 leg_direction=np.vstack(dirs))  # Cartesian unit vector per point
+
+
+def detect_preset(lattice, tol=1e-3):
+    """Pick a path preset from the reference lattice metric, or None.
+
+    Recognises simple cubic, tetragonal (unique axis c), orthorhombic,
+    hexagonal (gamma = 120 deg) and the fcc / bcc primitive cells.
+    """
+    L = np.asarray(lattice, float)
+    lens = np.linalg.norm(L, axis=1)
+
+    def ang(i, j):
+        return np.degrees(np.arccos(L[i] @ L[j] / lens[i] / lens[j]))
+
+    al, be, ga = ang(1, 2), ang(0, 2), ang(0, 1)
+    eq = lambda x, y: abs(x - y) <= tol * max(abs(x), abs(y), 1)  # noqa
+    right = all(eq(t, 90) for t in (al, be, ga))
+    if right:
+        a, b, c = lens
+        if eq(a, b) and eq(b, c):
+            return "cubic"
+        if eq(a, b):
+            return "tetragonal"
+        return "orthorhombic"
+    if eq(lens[0], lens[1]) and eq(al, 90) and eq(be, 90) and eq(ga, 120):
+        return "hexagonal"
+    if eq(lens[0], lens[1]) and eq(lens[1], lens[2]):
+        angs = (al, be, ga)
+        if all(eq(t, 60) for t in angs):
+            return "fcc"
+        if all(eq(t, 109.4712) for t in angs):
+            return "bcc"
+    return None

@@ -337,8 +337,9 @@ def run_unfolding(backend, reference, path=DEFAULT_PATH, path_frame=None,
         kc = bp["k_cart"][sl]
         if getattr(backend, "accepts_q_direction", False):
             # at Gamma, approach along the path leg (LO-TO splitting with NAC)
-            qd = [d if np.linalg.norm(k) < 1e-10 else None
-                  for k, d in zip(kc, bp["leg_direction"][sl])]
+            # direction of the path leg: used whenever some q+G vanishes
+            # (Gamma, and Gamma folded into a supercell at e.g. X, M, R)
+            qd = list(bp["leg_direction"][sl])
             f, ev = backend.solve(kc, q_directions=qd)
         else:
             f, ev = backend.solve(kc)
