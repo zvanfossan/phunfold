@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phunfold"
+version = "0.1.0"
+description = "Phonon band unfolding for VASP/phonopy supercells (e.g. ferroelectric domain walls)"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.20", "matplotlib>=3.3"]
+
+[project.optional-dependencies]
+phonopy = ["phonopy>=2.20"]
+
+[project.scripts]
+phunfold = "phunfold.__main__:main"
+
+[tool.setuptools]
+packages = ["phunfold"]
