@@ -128,14 +128,22 @@ def cmd_presets(a):
             print(f"{'':16s}{lab:3s} {np.round(q, 4).tolist()}{unit}")
 
 
-def _bulk_bands(bulk_dir, q_ref, fc_name="FORCE_CONSTANTS"):
-    """Bands of the bulk reference on the same reduced-q path (native)."""
+def _bulk_bands(bulk_dir, path, born=None, eps=None, fc_name="FORCE_CONSTANTS"):
+    """Bands of the bulk reference on the same reduced-q path (native), with
+    NAC when Born charges for that cell are available."""
     from .dynmat import NativeBackend
+    from .structure import read_structure
 
-    nb = NativeBackend(os.path.join(bulk_dir, "POSCAR"),
-                       os.path.join(bulk_dir, "SPOSCAR"),
-                       os.path.join(bulk_dir, fc_name))
-    f, _ = nb.solve(q_ref @ nb.structure.recip)
+    pos = read_structure(os.path.join(bulk_dir, "POSCAR"))
+    nac = None
+    if born is not None and len(born) == pos.natoms:
+        nac = dict(born=born, epsilon=eps, ref_volume=pos.volume)
+    nb = NativeBackend(pos, os.path.join(bulk_dir, "SPOSCAR"),
+                       os.path.join(bulk_dir, fc_name), nac=nac)
+    k = path["q"] @ nb.structure.recip
+    dirs = [d if np.linalg.norm(kk) < 1e-10 else None
+            for kk, d in zip(k, path["leg_direction"])]
+    f, _ = nb.solve(k, q_directions=dirs)
     return f
 
 
@@ -150,40 +158,71 @@ def _mapping_options(a):
                 allow_rotation=not a.no_rotation)
 
 
+def _born_for_cell(a, cell, reference, M):
+    """Born charges for ``cell`` from a LEPSILON vasprun.xml/OUTCAR given for
+    either the cell itself or the reference cell (then tiled by sublattice)."""
+    from .nac import read_born, tile_born
+    from .unfold import Unfolder
+
+    born, eps = read_born(a.born)
+    if len(born) == cell.natoms:
+        how = "given for this cell"
+        z, e = born, eps
+    elif len(born) == reference.natoms:
+        unf = Unfolder(cell, reference, supercell_matrix=M,
+                       **_mapping_options(a))
+        z, e = tile_born(unf, born, eps)
+        how = f"tiled from the {reference.natoms}-atom reference by sublattice"
+    else:
+        raise SystemExit(f"--born has {len(born)} atoms; expected {cell.natoms} "
+                         f"(this cell) or {reference.natoms} (reference cell)")
+    print(f"[phunfold] NAC: Born charges {how}; eps_inf diag = "
+          f"{np.round(np.diag(e), 3).tolist()}")
+    return born, eps, z, e
+
+
 def cmd_unfold(a):
     from .structure import read_structure
-    from .unfold import run_unfolding, Unfolder
+    from .unfold import run_unfolding
     from .lattice import reference_from_supercell
 
+    M = _parse_matrix(a.supercell_matrix)
+    born_raw = None
     if a.backend == "native":
         from .dynmat import NativeBackend
-        backend = NativeBackend(a.unitcell, a.sposcar, a.fc,
-                                masses=_parse_masses(a.mass),
-                                fc_units=a.fc_units,
-                                fc_threshold=a.fc_threshold)
-        print(f"[phunfold] native backend: {backend.structure.natoms} atoms, "
-              f"{backend.n_pairs} FC pairs; ASR correction "
-              f"{backend.asr_violation:.2e} eV/A^2")
+        cell = read_structure(a.unitcell)
     else:
         from .dynmat import PhonopyBackend
         backend = PhonopyBackend(a.phonopy_yaml, a.force_sets, a.fc_phonopy,
-                                 born=a.born)
-    M = _parse_matrix(a.supercell_matrix)
+                                 born=a.born_phonopy)
+        cell = backend.structure
     if a.reference == "auto":
         if M is None:
             raise SystemExit("--reference auto needs --supercell-matrix")
-        reference = reference_from_supercell(backend.structure, M)
+        reference = reference_from_supercell(cell, M)
         print(f"[phunfold] reference built from the supercell average: "
               f"{reference.natoms} sites {reference.symbols}")
     else:
         reference = read_structure(a.reference)
-    if a.backend == "phonopy" and a.born_outcar:
-        from .vasp import parse_outcar_born, tile_born
-        born_ref, eps = parse_outcar_born(a.born_outcar)
-        unf = Unfolder(backend.structure, reference, supercell_matrix=M,
-                       **_mapping_options(a))
-        backend.phonon.nac_params = dict(born=tile_born(unf, born_ref),
-                                         dielectric=eps)
+    nac = None
+    if a.born:
+        born_raw, eps_raw, z, e = _born_for_cell(a, cell, reference, M)
+        nac = dict(born=z, epsilon=e, ref_volume=reference.volume)
+    if a.backend == "native":
+        backend = NativeBackend(cell, a.sposcar, a.fc,
+                                masses=_parse_masses(a.mass),
+                                fc_units=a.fc_units,
+                                fc_threshold=a.fc_threshold, nac=nac)
+        print(f"[phunfold] native backend: {backend.structure.natoms} atoms, "
+              f"{backend.n_pairs} FC pairs; ASR correction "
+              f"{backend.asr_violation:.2e} eV/A^2")
+        if backend.nac is not None:
+            print(f"[phunfold] NAC (Gonze-Lee): {len(backend.nac.G)} G vectors, "
+                  f"Lambda {backend.nac.Lambda:.3f}, dipole part removed at "
+                  f"{backend.n_commensurate} commensurate q")
+    elif nac is not None:
+        backend.phonon.nac_params = dict(born=nac["born"],
+                                         dielectric=nac["epsilon"])
 
     projections = {}
     if a.dw_info and os.path.exists(a.dw_info):
@@ -204,7 +243,18 @@ def cmd_unfold(a):
     res.write_text(a.out + ".dat")
     print(f"[phunfold] sum rule {res.meta['sum_rule']:.4f} holds to "
           f"{res.meta['sum_rule_error']:.1e}; wrote {a.out}.npz, {a.out}.dat")
-    ref_bands = _bulk_bands(a.bulk_dir, res.path["q"]) if a.bulk_dir else None
+    ref_bands = None
+    if a.bulk_dir:
+        from .paths import resolve_path, make_band_path
+        from .unfold import Unfolder
+        unf = Unfolder(backend.structure, reference, supercell_matrix=M,
+                       **_mapping_options(a))
+        segs = resolve_path(a.path, a.path_frame, reference.lattice,
+                            unf.ref_lattice, backend.structure.lattice)
+        bp = make_band_path(segs, unf.ref_recip, a.density)
+        ref_bands = _bulk_bands(a.bulk_dir, bp,
+                                *((born_raw, eps_raw) if born_raw is not None
+                                  else (None, None)))
     if ref_bands is not None:
         np.save(a.out + "_bulk_bands.npy", ref_bands)
     _plot(res, a, ref_bands)
@@ -216,7 +266,10 @@ def _plot(res, a, ref_bands=None):
     import matplotlib.pyplot as plt
     from .plot import plot_unfolded
 
+    from .plot import UNITS
     ylim = tuple(a.ylim) if a.ylim else None
+    if a.sigma is None:
+        a.sigma = 0.12 * UNITS[a.units]
     panels = [("total", None)]
     panels += [("proj", p) for p in res.projections()]
     panels += [("res", r) for r in res.resolved()]
@@ -258,8 +311,9 @@ def _plot_opts(p):
     g = p.add_argument_group("plotting")
     g.add_argument("--units", default="THz", choices=["THz", "cm-1", "meV"])
     g.add_argument("--ylim", type=float, nargs=2)
-    g.add_argument("--sigma", type=float, default=0.12,
-                   help="Lorentzian broadening in --units")
+    g.add_argument("--sigma", type=float, default=None,
+                   help="Lorentzian broadening in --units (default 0.12 THz "
+                   "= 4 cm-1 = 0.5 meV)")
     g.add_argument("--size", type=float, default=10.0, help="marker size")
     g.add_argument("--dpi", type=int, default=200)
 
@@ -306,9 +360,11 @@ def main(argv=None):
     g.add_argument("--force-sets", default="FORCE_SETS", help="[phonopy]")
     g.add_argument("--fc-phonopy", default=None,
                    help="[phonopy] FORCE_CONSTANTS instead of FORCE_SETS")
-    g.add_argument("--born", help="[phonopy] BORN file of the supercell")
-    g.add_argument("--born-outcar", help="[phonopy] OUTCAR of a bulk "
-                   "LEPSILON run; Z* tiled onto the supercell for NAC")
+    g.add_argument("--born", help="non-analytical (LO-TO) correction: "
+                   "vasprun.xml or OUTCAR of a LEPSILON run, either for this "
+                   "cell or for the reference cell (then tiled by sublattice)")
+    g.add_argument("--born-phonopy", help="[phonopy] phonopy BORN file of "
+                   "this exact cell (alternative to --born)")
     g = p.add_argument_group("reference cell and atom mapping")
     g.add_argument("--reference", required=True,
                    help="small cell to unfold onto, or 'auto' = average of "
@@ -336,7 +392,7 @@ def main(argv=None):
     g.add_argument("--path-frame", default=None,
                    choices=["reference", "supercell", "cartesian"],
                    help="frame of the --path coordinates (default reference)")
-    g.add_argument("--density", type=float, default=60.0,
+    g.add_argument("--density", type=float, default=100.0,
                    help="k-points per 1/A along the path")
     g = p.add_argument_group("projections and decomposition")
     g.add_argument("--project", nargs="*", metavar="NAME=SPEC",

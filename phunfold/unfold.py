@@ -258,7 +258,7 @@ class UnfoldResult:
 
 
 def run_unfolding(backend, reference, path=DEFAULT_PATH, path_frame=None,
-                  supercell_matrix=None, density=60.0, npts=None,
+                  supercell_matrix=None, density=100.0, npts=None,
                   distortion_phase=True, projections=None, resolve=None,
                   gauge="r", batch=20, verbose=True, mapping_options=None,
                   # backwards-compatible domain-wall shortcut
@@ -335,7 +335,13 @@ def run_unfolding(backend, reference, path=DEFAULT_PATH, path_frame=None,
     for start in range(0, nq, batch):
         sl = slice(start, min(start + batch, nq))
         kc = bp["k_cart"][sl]
-        f, ev = backend.solve(kc)
+        if getattr(backend, "accepts_q_direction", False):
+            # at Gamma, approach along the path leg (LO-TO splitting with NAC)
+            qd = [d if np.linalg.norm(k) < 1e-10 else None
+                  for k, d in zip(kc, bp["leg_direction"][sl])]
+            f, ev = backend.solve(kc, q_directions=qd)
+        else:
+            f, ev = backend.solve(kc)
         freqs[sl] = f
         if groups is None:
             weights[sl] = unf.weights(kc, ev, gauge=gauge)
@@ -363,4 +369,5 @@ def run_unfolding(backend, reference, path=DEFAULT_PATH, path_frame=None,
                 vacancies=mp.n_vacancies, interstitials=mp.n_interstitials,
                 substitutions=mp.n_substitutions,
                 origin=np.round(mp.origin, 6).tolist())
+    meta["nac"] = bool(getattr(backend, "nac", None) is not None)
     return UnfoldResult(bp, freqs, weights, extra, meta)

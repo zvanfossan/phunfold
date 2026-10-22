@@ -93,6 +93,9 @@ phunfold unfold ... --reference auto --supercell-matrix "4 4 4" --any-species
 # path in supercell coordinates, or Cartesian (1/Å, reference-file frame)
 phunfold unfold ... --path "G 0 0 0, X 1/2 0 0" --path-frame supercell
 
+# polar material: LO-TO splitting from a VASP LEPSILON run (this cell or the reference cell)
+phunfold unfold ... --born ../born/vasprun.xml
+
 # isotopes, very large cells, Quantum ESPRESSO force constants
 phunfold unfold ... --mass O=17.999 --fc-threshold 1e-4 --fc-units Ry/bohr^2
 ```
@@ -176,6 +179,29 @@ reference wave vector k is
 * **Vacancies** are empty sites. **Interstitials** form one-atom ghost
   sublattices, so their weight spreads uniformly over k.
 
+### Non-analytical correction (polar materials)
+
+`--born FILE` (a `vasprun.xml` or `OUTCAR` from a `LEPSILON = .TRUE.` run)
+applies the Gonze–Lee dipole–dipole correction, the same method and default
+parameters as phonopy's `gonze` NAC:
+
+1. The dipole–dipole part, an Ewald sum over Born charges Z\* screened by ε∞,
+   is evaluated at the commensurate q-points of the force-constant supercell
+   and subtracted from the force constants.
+2. The short-range remainder is interpolated as usual.
+3. The dipole–dipole term is added back analytically at every k. At Γ, the
+   q → 0 limit is taken along each path segment, which gives the LO–TO
+   splitting.
+
+The Born charges may belong to the cell itself or to the reference cell. In
+the second case they are copied onto each supercell atom by sublattice (and
+rotated along with the cell if needed). That is a good approximation for walls
+and dilute defects; for strongly perturbed regions, compute Z\* of the full
+cell. The Ewald width and cutoff are taken from the reference cell's volume,
+so a supercell and its reference use the identical dipole sum and their
+spectra unfold consistently. Points exactly at Γ with no direction get TO
+modes only, as in phonopy.
+
 Built-in checks: 0 ≤ W ≤ 1 and Σ_J W_J(k) = 3·n_atoms/N (= 3·n_ref without
 vacancies or interstitials). This is printed as `sum rule … holds to …`.
 
@@ -189,9 +215,21 @@ always stored.
 ## Worked example: BaTiO3 domain walls with VASP (step by step)
 
 The example commands use phonopy ≥ 4 syntax. **phonopy 4.0 (May 2026) split
-the CLI:** setup steps (`-d`, `--rd`, `-f`, `--fz`) moved to `phonopy-init`.
-For phonopy 2.x/3.x, replace `phonopy-init` with `phonopy`, and use
-`phonopy-load` where `phonopy` is used for the phonon step.
+the CLI:** the setup steps moved to `phonopy-init`, and phonopy 4 needs
+Python ≥ 3.11. With phonopy 2.x/3.x (for example on a Python 3.9 cluster
+install), translate as follows:
+
+| phonopy ≥ 4 (used below) | phonopy 2.x / 3.x |
+|---|---|
+| `phonopy-init -d --dim … --pa P -c POSCAR` | `phonopy -d --dim … --pa P -c POSCAR` |
+| `phonopy-init --rd 150 --amplitude 0.03 …` | `phonopy --rd 150 --amplitude 0.03 …` |
+| `phonopy-init -f disp-*/vasprun.xml` | `phonopy -f disp-*/vasprun.xml` |
+| `phonopy-init --fz perfect/vasprun.xml -f disp-*/vasprun.xml` | see `phonopy -h` for `--fz` |
+| `phonopy --writefc --full-fc` | `phonopy-load --writefc --full-fc` |
+| `phonopy --band …` | `phonopy-load --band …` |
+
+All `phunfold` commands are the same for every phonopy version. phunfold
+needs `FORCE_CONSTANTS`, which phonopy writes only when asked (`--writefc`).
 
 ### Step 0 — Convergence and settings (bulk 5-atom cell)
 
@@ -338,11 +376,12 @@ with `phunfold plot unfolded.npz --ylim 0 800 --units cm-1`) and `unfolded.dat`
   They are no longer equivalent in the DW cell, so always compare the two.**
   Z is the polar axis. Pass your own path with
   `--path "G 0 0 0, X 1/2 0 0 | ..."`.
-* **LO–TO splitting:** the native backend has no non-analytic correction, so
-  polar TO/LO near Γ are not split. To include it, use the phonopy backend with
-  bulk Born charges tiled onto the DW cell:
-  `phunfold unfold --backend phonopy --phonopy-yaml phonopy_disp.yaml --force-sets FORCE_SETS --born-outcar ../02_born/OUTCAR --reference ../POSCAR_bulk`.
-  The bulk OUTCAR atom order must match `POSCAR_bulk`.
+* **LO–TO splitting:** add `--born ../02_born/vasprun.xml` (or the
+  `OUTCAR` of that run). The bulk Born charges and ε∞ are tiled onto the DW
+  cell by sublattice, and the Gonze–Lee dipole–dipole correction is applied
+  (see *Non-analytical correction* above). The atom order of the LEPSILON run
+  must match `POSCAR_bulk`. With `--bulk-dir`, the dashed bulk overlay gets the
+  same correction.
 * **Interpreting the plot:** bulk-like modes follow the dashed bulk bands with
   weight ≈ 1. Wall-localised modes are dispersionless along X, carry a
   reduced, spread-out weight, and a large fraction on the `wall` projection. A mode
@@ -390,6 +429,18 @@ with `phunfold plot unfolded.npz --ylim 0 800 --units cm-1`) and `unfolded.dat`
   `run_unfolding`; fcc preset coordinates; supercell path frame.
 * Force-constant pruning (same frequencies from about 12 % of the pairs) and
   mass overrides.
+
+`tests/test_nac.py` covers the non-analytical correction:
+
+* At the commensurate q-points of the force-constant supercell, NAC returns
+  the raw force-constant D(q) to 5·10⁻⁷ eV/Å². The removed and re-added dipole
+  parts cancel, which checks the phase conventions. The 10⁻⁷ comes from the
+  G-sphere truncation that phonopy uses as well.
+* The q → 0 jump equals 4πe²/V (d·Z)(d·Z)/(d·ε∞·d) exactly and matches the
+  small-q limit.
+* A 40-atom supercell with tiled Born charges unfolds onto the 5-atom NAC bands
+  to 2·10⁻¹⁵, including LO–TO at Γ.
+* Born charges and ε∞ are read correctly from `vasprun.xml`.
 
 * `examples/toy_dw_demo.py` runs the complete file-based CLI path (build-dw →
   SPOSCAR/FORCE_CONSTANTS → unfold → plot) on a wall with softened Ti–O bonds

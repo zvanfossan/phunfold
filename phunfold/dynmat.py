@@ -151,11 +151,16 @@ class NativeBackend:
     fc_threshold : drop force-constant blocks with max |Phi| below this
         (eV/A^2) after the ASR correction; speeds up and shrinks very large
         cells. 0 keeps everything (exact).
+    nac : None, or dict(born=(n_unitcell, 3, 3), epsilon=(3, 3)
+        [, ref_volume, num_G_points, g_cutoff, Lambda]) to apply the
+        Gonze-Lee non-analytical correction (see phunfold.nac).
     """
+
+    accepts_q_direction = True
 
     def __init__(self, unitcell, supercell, force_constants,
                  acoustic_sum_rule=True, masses=None, tol=1e-3,
-                 fc_units="eV/A^2", fc_threshold=0.0, chunk=200000):
+                 fc_units="eV/A^2", fc_threshold=0.0, chunk=200000, nac=None):
         from .structure import read_structure
 
         self.structure = (read_structure(unitcell) if not isinstance(
@@ -194,6 +199,28 @@ class NativeBackend:
         else:
             self.asr_violation = np.abs(fc_rep.sum(axis=1)).max()
 
+        # Gonze-Lee NAC: remove the dipole-dipole part of the supercell force
+        # constants (its Fourier transform at the commensurate q points);
+        # it is added back analytically in dynamical_matrix()
+        self.nac = None
+        if nac is not None:
+            from .nac import GonzeNAC
+            opts = dict(nac)
+            self.nac = GonzeNAC(self.structure, opts.pop("born"),
+                                opts.pop("epsilon"), **opts)
+            r_sc = sc.cart
+            qs = self.nac.commensurate_points(sc.lattice)
+            phi_dd = np.zeros_like(fc_rep)
+            dvec = r_sc[None, :, :] - r_sc[rep_sc][:, None, :]   # (nu, n_sc, 3)
+            for q in qs:
+                ddq = self.nac.dynamical_matrix(q)               # (nu,3,nu,3)
+                blk = ddq[:, :, s2p, :].transpose(0, 2, 1, 3)    # (nu,n_sc,3,3)
+                ph = np.exp(-2j * np.pi * dvec @ q)
+                phi_dd += (blk * ph[:, :, None, None]).real
+            phi_dd /= len(qs)
+            fc_rep = fc_rep - phi_dd
+            self.n_commensurate = len(qs)
+
         # difference vectors r_j - r_rep(p) with minimum-image multiplicity,
         # skipping negligible blocks and working in chunks to bound memory
         r_sc = sc.cart
@@ -221,22 +248,30 @@ class NativeBackend:
         m = self.structure.masses
         self._inv_sqrt_mm = 1.0 / np.sqrt(np.outer(m, m))
 
-    def dynamical_matrix(self, k_cart):
+    def dynamical_matrix(self, k_cart, q_direction=None):
+        """Mass-weighted D(k). With NAC, ``q_direction`` (Cartesian) sets the
+        direction of approach to Gamma (LO-TO splitting); at k = 0 without
+        a direction only TO modes are obtained, as in phonopy."""
         nu = self.structure.natoms
-        phase = np.exp(2j * np.pi * self._vec @ np.asarray(k_cart, float))
+        k_cart = np.asarray(k_cart, float)
+        phase = np.exp(2j * np.pi * self._vec @ k_cart)
         d = np.zeros((nu, nu, 3, 3), dtype=complex)
         np.add.at(d, (self._p, self._pp), self._fc * phase[:, None, None])
+        if self.nac is not None:
+            d += self.nac.dynamical_matrix(k_cart, q_direction).transpose(
+                0, 2, 1, 3)
         d *= self._inv_sqrt_mm[:, :, None, None]
         d = d.transpose(0, 2, 1, 3).reshape(3 * nu, 3 * nu)
         return 0.5 * (d + d.conj().T)
 
-    def solve(self, k_cart):
+    def solve(self, k_cart, q_directions=None):
         k_cart = np.atleast_2d(k_cart)
         n = 3 * self.structure.natoms
         freqs = np.empty((len(k_cart), n))
         vecs = np.empty((len(k_cart), n, n), dtype=complex)
         for i, k in enumerate(k_cart):
-            w2, ev = np.linalg.eigh(self.dynamical_matrix(k))
+            qd = None if q_directions is None else q_directions[i]
+            w2, ev = np.linalg.eigh(self.dynamical_matrix(k, qd))
             freqs[i] = np.sign(w2) * np.sqrt(np.abs(w2)) * VASP_TO_THZ
             vecs[i] = ev
         return freqs, vecs

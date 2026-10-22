@@ -153,7 +153,7 @@ def resolve_path(spec, frame, ref_lattice_file, ref_lattice_eff, sc_lattice):
 def make_band_path(segments, recip, density=60.0, npts=None):
     """Piecewise-linear path through ``segments`` (reduced coords of
     ``recip``). Returns dict(q, k_cart, x, ticks, labels)."""
-    qs, xs, ticks, labels = [], [], [], []
+    qs, xs, ticks, labels, dirs = [], [], [], [], []
     x0 = 0.0
     for iseg, seg in enumerate(segments):
         if iseg == 0:
@@ -168,9 +168,13 @@ def make_band_path(segments, recip, density=60.0, npts=None):
             t = np.linspace(0.0, 1.0, n + 1)
             qs.append(qa + t[:, None] * (qb - qa))
             xs.append(x0 + t * length)
+            dvec = (qb - qa) @ recip
+            dirs.append(np.tile(dvec / max(np.linalg.norm(dvec), 1e-30),
+                                (n + 1, 1)))
             x0 += length
             ticks.append(x0)
             labels.append(lb)
     q = np.vstack(qs)
     return dict(q=q, k_cart=q @ recip, x=np.concatenate(xs),
-                ticks=np.array(ticks), labels=labels)
+                ticks=np.array(ticks), labels=labels,
+                leg_direction=np.vstack(dirs))  # Cartesian unit vector per point

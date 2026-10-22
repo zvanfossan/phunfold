@@ -24,10 +24,31 @@ def _decorate(ax, path, ylim, units):
     ax.set_ylabel(UNIT_LABEL[units])
 
 
+def _upsample(x, f, w, factor):
+    """Linearly interpolate (sorted) frequencies and weights between
+    neighbouring k-points so steep branches render as continuous lines in the
+    spectral map. Path breaks (repeated x) are not interpolated across."""
+    if factor <= 1:
+        return x, f, w
+    xs, fs, ws = [x[:1]], [f[:1]], [w[:1]]
+    for i in range(len(x) - 1):
+        if x[i + 1] - x[i] <= 1e-12:
+            xs.append(x[i + 1:i + 2])
+            fs.append(f[i + 1:i + 2])
+            ws.append(w[i + 1:i + 2])
+            continue
+        t = np.linspace(0, 1, factor + 1)[1:, None]
+        xs.append(x[i] + t[:, 0] * (x[i + 1] - x[i]))
+        fs.append(f[i] + t * (f[i + 1] - f[i]))
+        ws.append(w[i] + t * (w[i + 1] - w[i]))
+    return np.concatenate(xs), np.vstack(fs), np.vstack(ws)
+
+
 def plot_unfolded(result, ax=None, style="spectral", units="THz", ylim=None,
-                  sigma=0.12, n_omega=600, wmin=0.02, size=14.0,
+                  sigma=None, n_omega=600, wmin=0.02, size=14.0,
                   color_by=None, cmap=None, reference_bands=None,
-                  title=None, colorbar=True, weights=None, vmax=None):
+                  title=None, colorbar=True, weights=None, vmax=None,
+                  upsample=6):
     """Plot an UnfoldResult.
 
     style : 'spectral' (broadened A(k,w) map), 'scatter' (fat bands, marker
@@ -39,13 +60,17 @@ def plot_unfolded(result, ax=None, style="spectral", units="THz", ylim=None,
     weights : plot these weights instead of result.weights (e.g. a
             species-resolved array result.extra['w_Ti']).
     vmax : colour-scale maximum of the spectral map (share between panels).
-    sigma : broadening in ``units``.
+    upsample : interpolation factor between k-points for the spectral map
+            (display only; 1 shows exactly the computed k-points).
+    sigma : broadening in ``units`` (default 0.12 THz converted to them).
     """
     import matplotlib.pyplot as plt
 
     if ax is None:
         _, ax = plt.subplots(figsize=(7, 4.5))
     c = UNITS[units]
+    if sigma is None:
+        sigma = 0.12 * c
     f = result.freqs * c
     w = result.weights if weights is None else weights
     x = result.path["x"]
@@ -54,8 +79,11 @@ def plot_unfolded(result, ax=None, style="spectral", units="THz", ylim=None,
     mappable = None
     if style in ("spectral", "both"):
         omega = np.linspace(ylim[0], ylim[1], n_omega)
-        a = spectral_function(f, w, omega, sigma=sigma)
-        mappable = ax.pcolormesh(x, omega, a, shading="gouraud",
+        xu, fu, wu = _upsample(x, np.sort(f, axis=1),
+                               np.take_along_axis(w, np.argsort(f, axis=1), 1),
+                               upsample)
+        a = spectral_function(fu, wu, omega, sigma=sigma)
+        mappable = ax.pcolormesh(xu, omega, a, shading="gouraud",
                                  cmap=cmap or "Greys",
                                  vmin=0, vmax=vmax or np.percentile(a, 99.5))
         if colorbar and color_by is None:
