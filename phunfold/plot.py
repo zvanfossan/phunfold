@@ -120,15 +120,16 @@ def plot_unfolded(result, ax=None, style="spectral", units="THz", ylim=None,
                   sigma=None, n_omega=600, wmin=0.02, size=14.0,
                   color_by=None, cmap=None, reference_bands=None,
                   title=None, colorbar=True, weights=None, vmax=None,
-                  upsample=6):
+                  upsample=6, reference_labels=None):
     """Plot an UnfoldResult.
 
     style : 'spectral' (broadened A(k,w) map), 'scatter' (fat bands, marker
             area ~ weight), or 'both'.
     color_by : None, or the name of an extra array (e.g.
             'wall_participation') used to colour scatter markers.
-    reference_bands : optional (freqs (nq, nb)) from a bulk reference cell
-            calculation on the same path, drawn as thin dashed lines.
+    reference_bands : optional bulk bands on the same path, drawn as thin
+            dashed lines: (nq, nb), or (n_domains, nq, nb) for one set per
+            domain (domain 1 blue, domain 2 orange).
     weights : plot these weights instead of result.weights (e.g. a
             species-resolved array result.extra['w_Ti']).
     vmax : colour-scale maximum of the spectral map (share between panels).
@@ -175,8 +176,19 @@ def plot_unfolded(result, ax=None, style="spectral", units="THz", ylim=None,
             ax.scatter(xx, f[sel], s=size * w[sel],
                        c="C3" if style == "both" else "k", lw=0, zorder=3)
     if reference_bands is not None:
-        xb, yb = _broken_lines(x, reference_bands * c)
-        ax.plot(xb, yb, color="C0", lw=0.7, ls="--", alpha=0.8, zorder=2)
+        rb = np.asarray(reference_bands, float)
+        sets = [rb] if rb.ndim == 2 else list(rb)
+        labels = reference_labels or ([None] if len(sets) == 1 else
+                                      [f"bulk, domain {i + 1}"
+                                       for i in range(len(sets))])
+        for i, (bands, lab) in enumerate(zip(sets, labels)):
+            xb, yb = _broken_lines(x, bands * c)
+            lines = ax.plot(xb, yb, color=f"C{i}", lw=0.7, ls="--",
+                            alpha=0.8, zorder=2)
+            if lab:
+                lines[0].set_label(lab)
+        if len(sets) > 1:
+            ax.legend(loc="lower right", fontsize=8, framealpha=0.9)
     _decorate(ax, result.path, ylim, units)
     if title:
         ax.set_title(title)

@@ -2,7 +2,8 @@
 
 Structures (POSCAR files for each step; run VASP with your own inputs)
   perovskite  cubic or polar/tetragonal ABX3 starting cell
-  build-dw    180-degree domain-wall supercell from a relaxed polar bulk cell
+  build-dw    domain-wall supercell: any pair of polarization directions
+              ([001]/[00-1], [111]/[-111], ...) and any wall normal [hkl]
   supercell   tile any cell with an integer matrix (test cells, rattled cells)
   disp-dirs   one folder per phonopy displacement, your own input files copied in
 
@@ -75,22 +76,48 @@ def cmd_perovskite(a):
 
 
 def cmd_build_dw(a):
+    import warnings
     from .structure import read_structure, write_poscar
-    from .domainwall import build_180_wall, write_info
+    from .domainwall import build_wall, write_info, fmt_dir
 
-    polar = read_structure(a.bulk)
+    bulk = read_structure(a.bulk)
     ref = read_structure(a.ref) if a.ref else None
-    sc, info = build_180_wall(polar, ncells=a.ncells, normal=a.normal,
-                              lateral=tuple(a.lateral), offset=a.offset,
-                              width=a.width, ref=ref,
-                              allow_charged=a.allow_charged)
-    write_poscar(sc, a.out, comment=f"180deg DW {a.ncells}+{a.ncells} cells")
+    normal = " ".join(a.normal)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            sc, info, doms = build_wall(
+                bulk, p1=a.p1, p2=a.p2, normal=normal, ncells=a.ncells,
+                lateral=tuple(a.lateral), offset=a.offset, width=a.width,
+                ref=ref, allow_charged=a.allow_charged,
+                bulk_direction=a.bulk_direction, strain=a.strain)
+        except ValueError as err:
+            raise SystemExit(f"build-dw: {err}")
+    for w in caught:
+        print(f"WARNING: {w.message}")
+    p1, p2 = fmt_dir(info["p1"]), fmt_dir(info["p2"])
+    write_poscar(sc, a.out, comment=f"{info['type']} DW {p1}/{p2} normal "
+                 f"{fmt_dir(info['normal_hkl'])} {a.ncells}+{a.ncells}")
     write_info(info, a.info)
+    print(f"bulk polar direction {fmt_dir(info['bulk_direction'])}; domains "
+          f"{p1} | {p2} ({info['wall_angle_deg']:.1f} deg wall"
+          f"{', CHARGED' if info['charged'] else ''})")
     print(f"wrote {a.out}: {sc.natoms} atoms, supercell matrix "
-          f"{info['supercell_matrix']}; walls at fractional "
-          f"{info['wall_positions']} along lattice vector {info['normal_axis']}")
-    print(f"wrote {a.info}  (keep it next to the wall calculation; "
-          "'phunfold unfold' uses it for the wall projection)")
+          f"{info['supercell_matrix']}; wall normal "
+          f"{fmt_dir(info['normal_hkl'])}, walls at fractional "
+          f"{info['wall_positions']} along lattice vector {info['normal_axis']}"
+          f" ({a.ncells} x {info['repeat_length_A']:.3f} A per domain)")
+    if not a.no_domains:
+        stem = os.path.splitext(a.out)[0] if "." in os.path.basename(a.out) \
+            else a.out
+        for i, (d, p) in enumerate(zip(doms, (p1, p2)), 1):
+            fn = f"{stem}_domain{i}"
+            write_poscar(d, fn, comment=f"single domain {i}, P along {p}")
+            print(f"wrote {fn}: 5-atom cell of domain {i} (P along {p}); "
+                  "use as --reference for unfolding")
+    print(f"wrote {a.info}  (keep it next to the wall calculation: 'phunfold "
+          "unfold' takes the wall projection, k-path and per-domain Born "
+          "charges from it)")
 
 
 def cmd_supercell(a):
@@ -204,9 +231,11 @@ def _mapping_options(a):
                 allow_rotation=not a.no_rotation)
 
 
-def _born_for_cell(a, cell, reference, M):
+def _born_for_cell(a, cell, reference, M, info=None):
     """Born charges for ``cell`` from a LEPSILON vasprun.xml/OUTCAR given for
-    either the cell itself or the reference cell (then tiled by sublattice)."""
+    the cell itself, for the bulk cell of a wall built by build-dw (then
+    rotated into each domain), or for the reference cell (tiled by
+    sublattice)."""
     from .nac import read_born, tile_born
     from .unfold import Unfolder
 
@@ -214,6 +243,13 @@ def _born_for_cell(a, cell, reference, M):
     if len(born) == cell.natoms:
         how = "given for this cell"
         z, e = born, eps
+    elif info is not None and "rotations" in info and \
+            len(born) == len(info["basis_frac"]):
+        from .domainwall import domain_born_charges
+        z, e, dom = domain_born_charges(cell, info, born, eps)
+        how = (f"from the bulk cell, rotated into each domain ({(dom == 1).sum()}"
+               f" | {(dom == 2).sum()} atoms, {(dom == 0).sum()} on the walls "
+               "averaged)")
     elif len(born) == reference.natoms:
         unf = Unfolder(cell, reference, supercell_matrix=M,
                        **_mapping_options(a))
@@ -227,9 +263,13 @@ def _born_for_cell(a, cell, reference, M):
     return born, eps, z, e
 
 
-def _bulk_bands(bulk_dir, path, born=None, eps=None):
-    """Bands of the bulk reference on the same reduced-q path, with NAC when
-    Born charges for that cell are available."""
+def _bulk_bands(bulk_dir, path, born=None, eps=None, rotations=None):
+    """Bands of the bulk cell in ``bulk_dir`` on the same reduced-q path, with
+    NAC when Born charges for that cell are available.
+
+    rotations : cubic operations g_d mapping the bulk onto each domain (from
+    dw_info.json). Domain d at q is the bulk at g_d^T q. Returns (nq, nb) for
+    one distinct domain, else (n_domains, nq, nb)."""
     from .dynmat import NativeBackend
     from .structure import read_structure
 
@@ -240,24 +280,34 @@ def _bulk_bands(bulk_dir, path, born=None, eps=None):
     if born is not None and len(born) == pos.natoms:
         nac = dict(born=born, epsilon=eps, ref_volume=pos.volume)
     nb = NativeBackend(pos, os.path.join(bulk_dir, "SPOSCAR"), fc, nac=nac)
-    k = path["q"] @ nb.structure.recip
-    f, _ = nb.solve(k, q_directions=list(path["leg_direction"]))
-    return f
+    gs = [np.eye(3)] if not rotations else [np.array(g, float) for g in rotations]
+    out = []
+    for g in gs:
+        q = path["q"] @ g                      # rows: (g^T q)^T = q^T g
+        d = path["leg_direction"] @ g
+        f, _ = nb.solve(q @ nb.structure.recip, q_directions=list(d))
+        if not any(np.allclose(f, o, atol=1e-6) for o in out):
+            out.append(f)
+    return out[0] if len(out) == 1 else np.array(out)
 
 
-def _resolve_path_arg(a, reference):
+def _resolve_path_arg(a, reference, info=None):
     from .paths import detect_preset
 
     if a.path != "auto":
         return a.path
-    if a.dw_info and os.path.exists(a.dw_info):
-        name = "dw-tetragonal"
-    else:
-        name = detect_preset(reference.lattice)
-        if name is None:
-            raise SystemExit("could not recognise the reference lattice for "
-                             "an automatic k-path; pass --path (a preset from "
-                             "'phunfold presets' or 'G 0 0 0, X 1/2 0 0, ...')")
+    if info is not None:
+        path = info.get("path", "dw-tetragonal")
+        note = ("" if path in ("dw-tetragonal",) else "  (N = along the wall "
+                "normal, T1/T2 = in the wall plane)")
+        print(f"[phunfold] k-path from {a.dw_info}: {path}{note}; override "
+              "with --path")
+        return path
+    name = detect_preset(reference.lattice)
+    if name is None:
+        raise SystemExit("could not recognise the reference lattice for "
+                         "an automatic k-path; pass --path (a preset from "
+                         "'phunfold presets' or 'G 0 0 0, X 1/2 0 0, ...')")
     print(f"[phunfold] k-path: preset '{name}' (override with --path)")
     return name
 
@@ -271,6 +321,9 @@ def _run(a):
 
     M = _parse_matrix(a.supercell_matrix)
     born_raw = eps_raw = None
+    info = None
+    if a.dw_info and os.path.exists(a.dw_info):
+        info = json.load(open(a.dw_info))
     if a.backend == "native":
         from .dynmat import NativeBackend
         _ensure_force_constants(a.fc)
@@ -290,7 +343,7 @@ def _run(a):
         reference = read_structure(a.reference)
     nac = None
     if a.born:
-        born_raw, eps_raw, z, e = _born_for_cell(a, cell, reference, M)
+        born_raw, eps_raw, z, e = _born_for_cell(a, cell, reference, M, info)
         nac = dict(born=z, epsilon=e, ref_volume=reference.volume)
     if a.backend == "native":
         backend = NativeBackend(cell, a.sposcar, a.fc,
@@ -307,8 +360,7 @@ def _run(a):
                                          dielectric=nac["epsilon"])
 
     projections = {}
-    if a.dw_info and os.path.exists(a.dw_info):
-        info = json.load(open(a.dw_info))
+    if info is not None:
         projections["wall"] = (f"slab:{info['normal_axis']}:"
                                f"{','.join(map(str, info['wall_positions']))}:"
                                f"{a.wall_width}")
@@ -316,7 +368,7 @@ def _run(a):
         name, spec = item.split("=", 1)
         projections[name.strip()] = spec.strip()
 
-    path = _resolve_path_arg(a, reference)
+    path = _resolve_path_arg(a, reference, info)
     res = run_unfolding(backend, reference, path, path_frame=a.path_frame,
                         supercell_matrix=M, density=a.density,
                         distortion_phase=not a.no_distortion_phase,
@@ -333,8 +385,13 @@ def _run(a):
         segs = resolve_path(path, a.path_frame, reference.lattice,
                             unf.ref_lattice, backend.structure.lattice)
         bp = make_band_path(segs, unf.ref_recip, a.density)
-        ref_bands = _bulk_bands(a.bulk_dir, bp, born_raw, eps_raw)
+        rots = info.get("rotations") if info else None
+        ref_bands = _bulk_bands(a.bulk_dir, bp, born_raw, eps_raw, rots)
         np.save(a.out + "_bulk_bands.npy", ref_bands)
+        if np.ndim(ref_bands) == 3:
+            print(f"[phunfold] bulk overlay: {len(ref_bands)} distinct domain "
+                  "dispersions on this path (dashed blue = domain 1, orange = "
+                  "domain 2)")
     return res, ref_bands, backend
 
 
@@ -529,8 +586,8 @@ def _common_unfold_opts(p, check=False):
                    help="phonopy.unfolding convention (ignore r_s - x_s)")
     g = p.add_argument_group("k path")
     g.add_argument("--path", default="auto",
-                   help="'auto' (from the reference lattice; dw-tetragonal "
-                   "with dw_info.json), a preset ('phunfold presets'), or "
+                   help="'auto' (from dw_info.json if present, else from "
+                   "the reference lattice), a preset ('phunfold presets'), or "
                    "'G 0 0 0, X 0 1/2 0, M 1/2 1/2 0 | ...'")
     g.add_argument("--path-frame", default=None,
                    choices=["reference", "supercell", "cartesian"])
@@ -582,19 +639,54 @@ def main(argv=None):
     p.add_argument("--out", default="POSCAR")
     p.set_defaults(func=cmd_perovskite)
 
-    p = sub.add_parser("build-dw", help="180-degree domain-wall supercell")
-    p.add_argument("--bulk", required=True, help="relaxed polar bulk cell "
-                   "(e.g. the tetragonal CONTCAR)")
+    p = sub.add_parser(
+        "build-dw", help="domain-wall supercell (any polarization pair)",
+        formatter_class=fmt, description=(
+            "Domain-wall supercell from a relaxed polar bulk cell. Each domain "
+            "is the bulk structure mapped by the cubic symmetry operation that "
+            "takes the bulk polarization onto --p1 / --p2.\n\nexamples:\n"
+            "  # 180 deg tetragonal wall, BaO-centred, normal [100]\n"
+            "  phunfold build-dw --bulk tet/CONTCAR --p1 0 0 1 --p2 0 0 -1 "
+            "--normal a\n"
+            "  # 71 deg rhombohedral wall on (011)\n"
+            "  phunfold build-dw --bulk rho/CONTCAR --p1 1 1 1 --p2 -1 1 1 "
+            "--normal 0 1 1\n"
+            "  # 109 deg rhombohedral wall on (001)\n"
+            "  phunfold build-dw --bulk rho/CONTCAR --p1 1 1 1 --p2 -1 -1 1 "
+            "--normal 0 0 1"))
+    p.add_argument("--bulk", required=True, help="relaxed polar 5-atom "
+                   "pseudocubic cell, axes along x, y, z (tetragonal, "
+                   "orthorhombic or rhombohedral CONTCAR)")
+    p.add_argument("--p1", type=int, nargs=3, metavar=("U", "V", "W"),
+                   help="polarization direction of domain 1 (default: the "
+                   "bulk direction)")
+    p.add_argument("--p2", type=int, nargs=3, metavar=("U", "V", "W"),
+                   help="polarization direction of domain 2 (default: -p1, "
+                   "a 180 deg wall)")
+    p.add_argument("--normal", nargs="+", default=["a"],
+                   help="wall normal: a, b, c or three integers h k l "
+                   "(e.g. 0 1 1)")
+    p.add_argument("--ncells", type=int, default=4, help="stacking repeats "
+                   "per domain (one repeat = the normal vector [hkl]; one "
+                   "cell for a, b, c)")
+    p.add_argument("--lateral", type=int, nargs=2, default=[1, 1],
+                   help="repetitions along the two in-plane vectors")
+    p.add_argument("--offset", type=float, default=0.0,
+                   help="wall position in repeats: 0 = plane through the "
+                   "A-site at the origin, 0.5 = B-site plane for a/b/c normals")
+    p.add_argument("--width", type=float, default=0.0,
+                   help="tanh wall width in repeats (0 = abrupt)")
+    p.add_argument("--strain", choices=["average", "domain1"],
+                   default="average", help="lattice of the wall cell: average "
+                   "of the two domain strains (default) or domain 1's")
+    p.add_argument("--bulk-direction", type=int, nargs=3,
+                   metavar=("U", "V", "W"), help="override the bulk polar "
+                   "direction inferred from the displacements")
     p.add_argument("--ref", help="centrosymmetric reference with the same "
                    "atom order (default: snap coordinates to 0 / 0.5)")
-    p.add_argument("--ncells", type=int, default=4, help="cells per domain")
-    p.add_argument("--normal", default="a", help="wall normal: a, b or c")
-    p.add_argument("--lateral", type=int, nargs=2, default=[1, 1])
-    p.add_argument("--offset", type=float, default=0.0,
-                   help="0 = A-site (BaO) centred wall, 0.5 = B-site (TiO2)")
-    p.add_argument("--width", type=float, default=0.0,
-                   help="tanh wall width in cells (0 = abrupt)")
     p.add_argument("--allow-charged", action="store_true")
+    p.add_argument("--no-domains", action="store_true",
+                   help="do not write the single-domain 5-atom cells")
     p.add_argument("--out", default="POSCAR_DW")
     p.add_argument("--info", default="dw_info.json")
     p.set_defaults(func=cmd_build_dw)

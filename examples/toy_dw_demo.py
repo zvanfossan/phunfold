@@ -44,12 +44,16 @@ sh(f"{sys.executable} -m phunfold build-dw --bulk POSCAR_bulk --ncells 4 "
 
 # --- step 4 stand-in: "phonopy -d --dim 1 2 2" and force constants --------
 dw = read_poscar("POSCAR_DW")
-unf = Unfolder(dw, snap_reference(polar))   # centrosymmetric sites
-ideal = Structure(dw.lattice, unf.ideal_cart @ np.linalg.inv(dw.lattice),
-                  dw.symbols)
 dim = np.diag([1, 2, 2])
-sposcar_ideal = tile(ideal, dim)
-sposcar = tile(dw, dim)                 # same atom order as sposcar_ideal
+sposcar = tile(dw, dim)
+# Ideal (centrosymmetric) site of every SPOSCAR atom, NOT re-wrapped into the
+# cell, so force-constant index j refers to exactly SPOSCAR atom j. (Tiling a
+# separately wrapped ideal cell can pick a different periodic copy for atoms
+# sitting next to a cell boundary.)
+unf = Unfolder(sposcar, snap_reference(polar))
+sposcar_ideal = Structure(sposcar.lattice,
+                          unf.ideal_cart @ np.linalg.inv(sposcar.lattice),
+                          sposcar.symbols)
 Lx = dw.lattice[0, 0]
 cart = sposcar_ideal.cart
 

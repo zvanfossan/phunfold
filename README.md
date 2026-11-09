@@ -15,7 +15,7 @@ the LO–TO (non-analytical) correction for polar materials.
 
 ```
 phunfold perovskite   cubic or polar/tetragonal ABX3 starting POSCAR
-phunfold build-dw     180° domain-wall supercell POSCAR from a relaxed polar cell
+phunfold build-dw     domain-wall POSCAR: domain polarizations as [uvw] (e.g. [001]/[00-1], [111]/[-111]), any wall normal [hkl]
 phunfold supercell    any cell × integer matrix (test cells, rattled cells)
 phunfold disp-dirs    perfect/ + disp-NNN/ folders after `phonopy -d`, with your input files copied in
 phunfold check        verify the whole chain in a bulk phonon folder (PASS/FAIL)
@@ -139,8 +139,8 @@ BaTiO3 is itself unstable toward polarization rotation.
 
 ```bash
 cd BTO/dw
-phunfold build-dw --bulk ../tet/relax/CONTCAR --ncells 4 --normal a --offset 0
-#   -> POSCAR_DW (40 atoms, 8 cells along a) and dw_info.json
+phunfold build-dw --bulk ../tet/relax/CONTCAR --p1 0 0 1 --p2 0 0 -1 --normal a --ncells 4
+#   -> POSCAR_DW (40 atoms, 8 cells along a), POSCAR_DW_domain1/2 and dw_info.json
 cp POSCAR_DW relax/POSCAR      # relax/: ions only (ISIF = 2), forces < ~5e-4 eV/A
 cd phonon
 cp ../relax/CONTCAR POSCAR
@@ -155,31 +155,98 @@ phunfold unfold --reference ../../tet/relax/CONTCAR \
 
 * `--reference` is the cell to unfold onto, the relaxed tetragonal 5-atom
   cell.
-* `--born` should come from the **tetragonal** LEPSILON run. Its charges are
-  copied onto every wall atom by sublattice.
+* `--born` should come from the **tetragonal** LEPSILON run. Its tensors are
+  rotated into each domain using `dw_info.json` (see step 6).
 * `--bulk-dir` draws the tetragonal bulk bands, dashed, with the same NAC.
-* `--dw-info` adds a `wall` projection, and selects the `dw-tetragonal` path
-  automatically.
+* `--dw-info` adds a `wall` projection and sets the k-path.
 
-Build-dw options:
-* `--offset 0` gives the Ba-centred wall (the low-energy one in BaTiO3), and
-  `--offset 0.5` the Ti-centred one.
-* `--ncells` sets the wall separation.
+How `build-dw` builds the wall:
+* Each domain is the relaxed bulk structure mapped by the cubic symmetry
+  operation that takes the bulk polarization onto `--p1` or `--p2`. Mapping
+  the whole pattern, not just a vector, also relabels the apical and
+  equatorial oxygens and rotates the spontaneous strain.
+* The wall cell takes the average of the two domains' strains
+  (`--strain domain1` uses domain 1's instead).
+* `--p1` defaults to the bulk direction and `--p2` to −p1, so the command
+  above without them gives the same cell as before.
+
+Options:
+* `--normal` is `a`/`b`/`c` or any `h k l`. For a/b/c the stacking stays
+  along that lattice vector (diagonal supercell matrix). For other normals the
+  lattice vectors are two in-plane vectors and the normal [hkl], with stacking
+  along the third.
+* `--ncells` sets the stacking repeats per domain. One repeat is the vector
+  [hkl], i.e. one cell for a/b/c and √2·a for [011].
+* `--offset 0` puts the wall through the A-site plane (Ba-centred, the
+  low-energy 180° wall in BaTiO3). For a/b/c normals, `--offset 0.5` gives the
+  B-site plane.
 * `--lateral` repeats the cell in the wall plane.
 
-The code refuses P ∥ wall normal (a charged head-to-head wall) unless you pass
-`--allow-charged`.
+Checks:
+* A wall is refused when (P1 − P2)·n ≠ 0, i.e. charged, unless you pass
+  `--allow-charged`.
+* `build-dw` warns when the two domains' spontaneous strains differ within the
+  wall plane. That orientation is mechanically incompatible.
 
 **Reading `dw_unfolded.png`:**
 - **Left panel:** the unfolded spectral function. Bulk-like modes follow the
-  dashed tetragonal bands with weight ≈ 1.
+  dashed bulk bands with weight ≈ 1.
 - **Right panel:** each mode coloured by its fraction on atoms within 2.5 Å of
-  a wall (`--wall-width`).
-- **Wall-localised modes** are dispersionless along Γ–X (X is normal to the
-  wall), carry reduced, smeared weight, and are bright in the right panel.
-  They can disperse along Γ–Y, which lies in the wall plane.
+  a wall (`--wall-width`). The baseline for a delocalised mode depends on
+  which species it moves.
+- **Wall-localised modes** are dispersionless along the wall normal (Γ–X here,
+  N in general), carry reduced, smeared weight, and are bright in the right
+  panel. They can disperse in the wall plane.
 
 Converge the wall-mode frequencies with `--ncells 6` and `--dim 1 3 3`.
+
+### 6. Rhombohedral domains: 71°, 109° and 180° walls
+
+Relax a rhombohedral R3m cell in the 5-atom pseudocubic setting: a 5-atom
+cell with lattice vectors along x, y and z and the polarization along [111].
+Then build the wall from it:
+
+```bash
+phunfold perovskite --a 4.00 --out rho/relax/POSCAR      # cubic start ...
+#   ... displace Ti/O along [111] (or start from your own R3m cell), relax with ISIF = 3
+phunfold build-dw --bulk rho/relax/CONTCAR --p1 1 1 1 --p2 -1 1 1 --normal 0 1 1 --ncells 4   # 71°  on (011)
+phunfold build-dw --bulk rho/relax/CONTCAR --p1 1 1 1 --p2 -1 -1 1 --normal 0 0 1 --ncells 4  # 109° on (001)
+phunfold build-dw --bulk rho/relax/CONTCAR --p1 1 1 1 --p2 -1 -1 -1 --normal 1 -1 0           # 180° on (1-10)
+```
+
+Then unfold onto the rhombohedral cell, either domain 1's (written by
+`build-dw`) or the relaxed bulk itself:
+
+```bash
+phunfold unfold --reference ../POSCAR_DW_domain1 --born ../../rho/born/vasprun.xml \
+                --bulk-dir ../../rho/phonon --dw-info ../dw_info.json --out dw71
+```
+
+* **k-path:** taken from `dw_info.json`. N lies along the wall normal; T1 and
+  T2 lie in the wall plane. For a rhombohedral reference without `dw_info`,
+  `--path auto` uses the `rhombohedral` preset Γ–L–F–Γ–Z–L | F–Z (Z along the
+  polar axis).
+* **Born charges:** R3m Born tensors and ε∞ have off-diagonal parts that
+  differ between the two domains. With `dw_info.json`, `--born` takes the bulk
+  LEPSILON run (same atom order as the bulk cell given to `build-dw`):
+  - each atom gets g_d Z g_dᵀ for its domain d;
+  - atoms on a wall plane get the average of the two domains;
+  - ε∞ is the average of the two domains' tensors.
+* **Bulk overlay:** `--bulk-dir` (the bulk phonon folder) is drawn once per
+  domain wherever the two domains' dispersions differ: blue for domain 1,
+  orange for domain 2. For the 71° wall they coincide wherever k_x = 0 or ½,
+  and separate elsewhere.
+* **Rhombohedral vs cubic reference:** the 5-atom R3m cell and the cubic
+  cell have the same translation lattice. The two sets of ideal sites differ
+  only by a constant shift per sublattice, which drops out of the weights. So
+  unfolding onto either gives identical weights (tested to 10⁻¹⁰). What the
+  rhombohedral cell changes is the comparison: the dashed bulk bands, the
+  path labels and the Born charges are those of the R3m phase.
+* **Force-constant supercell size:** use lateral `--dim` of at least 3 (about
+  12 Å). If the box is only twice a bond length, force constants at exactly
+  half the box are split between two periodic images. Polar displacements
+  break that tie, and phonopy (and phunfold) then assign the whole force
+  constant to the slightly shorter image.
 
 ### Commands for phonopy ≥ 4
 
@@ -234,7 +301,7 @@ phunfold unfold --reference POSCAR_prim --mass O=17.999 --fc-threshold 1e-4 --fc
 Projection specs: `species:Ti,O`, `atoms:0-19`, `sites:0`,
 `slab:AXIS:F1,F2:WIDTH`, `sphere:F1,F2,F3:RADIUS`, `interstitials`,
 `substituted`. Path presets (`phunfold presets`): `cubic`, `tetragonal`,
-`orthorhombic`, `hexagonal`, `fcc`, `bcc`, `dw-tetragonal`. `--path auto`, the
+`orthorhombic`, `hexagonal`, `rhombohedral` (pseudocubic R3m), `fcc`, `bcc`, `dw-tetragonal`. `--path auto`, the
 default, picks one from the reference lattice.
 
 ### Orientation choices
@@ -382,6 +449,22 @@ eigen-solver plugs in through `phunfold.CallableBackend(structure, fn)`.
 `tests/test_general.py` also checks the POSCAR builders (cubic and polar
 perovskite → domain wall) and `disp-dirs`. The `check` command applies the
 same exact-agreement test to your own data.
+
+`tests/test_domainwall.py` covers the general wall builder and the
+rhombohedral reference:
+
+* `[001]`/`[00-1]` reproduces the original 180° builder exactly (a frozen copy
+  of the old code is part of the test).
+* 71° (011) wall from a toy R3m bulk whose O atoms also move perpendicular to
+  [111]: every atom off the wall planes carries exactly its domain's pattern
+  (the bulk, or its x-mirror).
+* The 109° (001) wall builds; the 109° (1-10) wall triggers the
+  compatibility warning; charged walls and non-equivalent directions are
+  refused.
+* Per-domain Born charges are correct on a species-sorted POSCAR.
+* Unfolding onto the rhombohedral cell gives weights identical to the cubic
+  reference. With polarization-independent springs, the wall-cell spectrum
+  lies on the R3m bulk bands to 10⁻⁷ THz.
 
 * `examples/toy_dw_demo.py` runs the complete file-based CLI path (build-dw →
   SPOSCAR/FORCE_CONSTANTS → unfold → plot) on a wall with softened Ti–O bonds

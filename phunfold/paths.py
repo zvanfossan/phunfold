@@ -59,6 +59,13 @@ PRESETS = {
                             P=[.25, .25, .25]),
                 path="G H N G P H | P N"),
 }
+# Rhombohedral R3m in the pseudocubic 5-atom setting (alpha close to 90 deg,
+# RHL1 labels of Setyawan & Curtarolo): Z = (1/2,1/2,1/2) lies along the
+# threefold (polar) axis, L and F are the X- and M-type points.
+PRESETS["rhombohedral"] = dict(
+    frame="reference",
+    points=_pts(G=[0, 0, 0], L=[.5, 0, 0], F=[.5, .5, 0], Z=[.5, .5, .5]),
+    path="G L F G Z L | F Z")
 # Domain-wall default: in-plane (Y) and out-of-plane (X) directions kept
 # separate, polar axis along c.
 PRESETS["dw-tetragonal"] = dict(
@@ -210,4 +217,6 @@ def detect_preset(lattice, tol=1e-3):
             return "fcc"
         if all(eq(t, 109.4712) for t in angs):
             return "bcc"
+        if eq(al, be) and eq(be, ga) and 80 < al < 100:
+            return "rhombohedral"           # pseudocubic R3m setting
     return None
